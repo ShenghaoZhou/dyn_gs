@@ -1,15 +1,17 @@
 import cv2
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 from data import HOT3DDataLoader
 from pathlib import Path
 import tyro
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tqdm import tqdm
 import pyceres
 import pycolmap
 import pycolmap.cost_functions
 import trimesh
+from typing import List
 
 @dataclass
 class Config:
@@ -22,7 +24,9 @@ class Config:
     min_track_len: int = 5
     huber_loss: float = 1.0
     output_dir: str = "outputs"
-    scale: float = 1.0
+    scale: List[float] = field(default_factory=lambda: [1.0])
+    use_gt_obj_pose: bool = False
+    two_view_scale_with_gt: bool = False
 
 def get_t_c_o(frame, obj_pose):
     T_c_w = frame["extrin"]
@@ -30,33 +34,18 @@ def get_t_c_o(frame, obj_pose):
     T_c_o = T_c_w @ T_w_o
     return T_c_o
 
-def triangulate_track(track, poses, K):
-    f_idxs = list(track.keys())
-    f_idxs.sort()
-    idx1, idx2 = f_idxs[0], f_idxs[-1]
+def triangulate_track(pt1, pt2, K, T21):
+    P1 = K @ np.eye(3, 4)
+    P2 = K @ T21[:3, :]
     
-    if idx1 not in poses or idx2 not in poses or idx1 == idx2:
-        return None
-        
-    T1 = poses[idx1]
-    T2 = poses[idx2]
-    P1 = K @ T1[:3, :]
-    P2 = K @ T2[:3, :]
+    pt1_reshaped = pt1.reshape(-1, 2).astype(float)
+    pt2_reshaped = pt2.reshape(-1, 2).astype(float)
     
-    pt1 = track[idx1].reshape(-1, 2).astype(float)
-    pt2 = track[idx2].reshape(-1, 2).astype(float)
-    
-    # Check baseline to avoid ill-conditioned triangulation
-    C1 = -T1[:3, :3].T @ T1[:3, 3]
-    C2 = -T2[:3, :3].T @ T2[:3, 3]
-    if np.linalg.norm(C1 - C2) < 0.01: # Need at least 1cm baseline
-        return None
-
-    X4 = cv2.triangulatePoints(P1, P2, pt1.T, pt2.T)
+    X4 = cv2.triangulatePoints(P1, P2, pt1_reshaped.T, pt2_reshaped.T)
     X3 = X4[:3, 0] / X4[3, 0]
     
-    P_c1 = T1[:3, :3] @ X3 + T1[:3, 3]
-    P_c2 = T2[:3, :3] @ X3 + T2[:3, 3]
+    P_c1 = X3
+    P_c2 = T21[:3, :3] @ X3 + T21[:3, 3]
     
     # Check if point is in front of the camera (Z > 0)
     if P_c1[2] <= 0 or P_c2[2] <= 0:
@@ -68,6 +57,19 @@ def main(cfg: Config):
     data_loader = HOT3DDataLoader(Path(cfg.data_root) / cfg.data_seq)
     rr.init("dynamic_object_ba")
     rr.connect_grpc("rerun+http://128.175.109.248:9876/proxy")
+
+    # Define and send blueprint
+    blueprint = rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(name="World View", origin="world"),
+            rrb.Vertical(
+                rrb.Spatial3DView(name="Object Centric", origin="object"),
+                rrb.Spatial2DView(name="Camera View", origin="world/camera/view"),
+            ),
+        ),
+        collapse_panels=True,
+    )
+    rr.send_blueprint(blueprint)
 
     indices = []
     if len(data_loader.dynamic_phases) > 0:
@@ -138,13 +140,78 @@ def main(cfg: Config):
         
         prev_gray, prev_pts, prev_ids = gray.copy(), current_pts, current_ids
 
+    # Pose Initialization
+    T_c_o_init = {idx: frame_data[idx]["T_c_o_gt"] for idx in indices}
+
     valid_tracks = {tid: t for tid, t in tracks.items() if len(t) >= cfg.min_track_len}
-    print(f"Triangulating {len(valid_tracks)} tracks...")
+    print(f"Triangulating {len(valid_tracks)} tracks using {'ground truth' if cfg.use_gt_obj_pose else 'essential matrix'} initialization...")
+    
+    rel_poses = {} # (idx1, idx2) -> T21
     pts3D_init = {}
-    for tid, t_obs in valid_tracks.items():
-        K = frame_data[min(t_obs.keys())]["K"]
-        X = triangulate_track(t_obs, {i: frame_data[i]["T_c_o_gt"] for i in t_obs}, K)
-        if X is not None: pts3D_init[tid] = X
+    
+    for tid, t_obs in tqdm(valid_tracks.items(), desc="Triangulating"):
+        f_idxs = sorted(t_obs.keys())
+        idx1, idx2 = f_idxs[0], f_idxs[-1]
+        
+        K = frame_data[idx1]["K"]
+        pt1 = t_obs[idx1]
+        pt2 = t_obs[idx2]
+        
+        if (idx1, idx2) not in rel_poses:
+            if cfg.use_gt_obj_pose:
+                T1 = T_c_o_init[idx1]
+                T2 = T_c_o_init[idx2]
+                
+                # Check baseline
+                C1 = -T1[:3, :3].T @ T1[:3, 3]
+                C2 = -T2[:3, :3].T @ T2[:3, 3]
+                if np.linalg.norm(C1 - C2) < 0.01:
+                    rel_poses[(idx1, idx2)] = None
+                else:
+                    rel_poses[(idx1, idx2)] = T2 @ np.linalg.inv(T1)
+            else:
+                # Find all common tracks between idx1 and idx2 for Essential Matrix
+                pts1_all, pts2_all = [], []
+                for other_tid, other_obs in valid_tracks.items():
+                    if idx1 in other_obs and idx2 in other_obs:
+                        pts1_all.append(other_obs[idx1])
+                        pts2_all.append(other_obs[idx2])
+                
+                if len(pts1_all) < 8: # Need enough points for robust E
+                    rel_poses[(idx1, idx2)] = None
+                else:
+                    pts1_all = np.array(pts1_all)
+                    pts2_all = np.array(pts2_all)
+                    E, mask = cv2.findEssentialMat(pts1_all, pts2_all, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+                    if E is not None and E.shape == (3, 3):
+                        _, R, t, mask = cv2.recoverPose(E, pts1_all, pts2_all, K, mask=mask)
+                        
+                        T21 = np.eye(4)
+                        T21[:3, :3] = R
+                        
+                        if cfg.two_view_scale_with_gt:
+                            # Scale t to match GT baseline for initialization consistency
+                            T1_gt = T_c_o_init[idx1]
+                            T2_gt = T_c_o_init[idx2]
+                            C1_gt = -T1_gt[:3, :3].T @ T1_gt[:3, 3]
+                            C2_gt = -T2_gt[:3, :3].T @ T2_gt[:3, 3]
+                            baseline_gt = np.linalg.norm(C1_gt - C2_gt)
+                            T21[:3, 3] = t.flatten() * baseline_gt
+                        else:
+                            T21[:3, 3] = t.flatten()
+                            
+                        rel_poses[(idx1, idx2)] = T21
+                    else:
+                        rel_poses[(idx1, idx2)] = None
+        
+        T21 = rel_poses[(idx1, idx2)]
+        if T21 is not None:
+            X_c1 = triangulate_track(pt1, pt2, K, T21)
+            if X_c1 is not None:
+                # Convert from camera 1 frame to object frame
+                T_c1_o = T_c_o_init[idx1]
+                X_o = np.linalg.inv(T_c1_o) @ np.append(X_c1, 1)
+                pts3D_init[tid] = X_o[:3]
 
     # Bundle Adjustment
     print("Starting Bundle Adjustment...")
@@ -174,7 +241,7 @@ def main(cfg: Config):
     loss = pyceres.HuberLoss(cfg.huber_loss) if cfg.huber_loss > 0 else pyceres.TrivialLoss()
 
     for idx in indices:
-        T = frame_data[idx]["T_c_o_gt"]
+        T = T_c_o_init[idx]
         q = np.array(pycolmap.Rotation3d(T[:3, :3]).quat)
         t = np.array(T[:3, 3])
         pose_params[idx] = (q, t)
@@ -242,76 +309,53 @@ def main(cfg: Config):
             if idx in idx_to_tracks:
                 idx_to_tracks[idx].append((tid, uv))
 
-    rr.log("object", rr.Transform3D(translation=[0, 0, 0], mat3x3=np.eye(3)), static=True)
-    rr.log("object/points/init", rr.Points3D(np.array(list(pts3D_init.values())) * cfg.scale, colors=[(100, 100, 100)], radii=0.002), static=True)
-    rr.log("object/points/optimized", rr.Points3D(np.array(list(point_params.values())) * cfg.scale, colors=[(0, 255, 0)], radii=0.003), static=True)
-
-    # World-centric logging
+    # --- Shared World Logging (GT and Camera) ---
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
-    rr.log("world/object/points", rr.Points3D(np.array(list(point_params.values())) * cfg.scale, colors=[(0, 255, 0)], radii=0.003), static=True)
-
-    # Log GT object mesh
+    
+    # Log GT object mesh (unscaled, static relative to its moving parent world/object_gt)
     obj_mesh = data_loader.obj_mesh
     if isinstance(obj_mesh, trimesh.Scene):
-        # Merge all geometries into one mesh for simplicity
         obj_mesh = obj_mesh.dump(concatenate=True)
-    
-    # Extract vertices and faces
-    vertices = obj_mesh.vertices
-    faces = obj_mesh.faces
-    
-    # Some meshes might have colors
-    mesh_colors = None
-    if hasattr(obj_mesh.visual, 'vertex_colors'):
-        mesh_colors = obj_mesh.visual.vertex_colors
-    
     rr.log("world/object_gt/mesh", rr.Mesh3D(
-        vertex_positions=vertices,
-        triangle_indices=faces,
-        vertex_colors=mesh_colors,
+        vertex_positions=obj_mesh.vertices,
+        triangle_indices=obj_mesh.faces,
+        vertex_colors=obj_mesh.visual.vertex_colors if hasattr(obj_mesh.visual, 'vertex_colors') else None,
         vertex_normals=obj_mesh.vertex_normals
     ), static=True)
 
-    world_obj_positions = []
+    # Log mesh to object centric view (static at origin)
+    rr.log("object/mesh", rr.Mesh3D(
+        vertex_positions=obj_mesh.vertices,
+        triangle_indices=obj_mesh.faces,
+        vertex_colors=obj_mesh.visual.vertex_colors if hasattr(obj_mesh.visual, 'vertex_colors') else None,
+        vertex_normals=obj_mesh.vertex_normals
+    ), static=True)
+
     gt_world_obj_positions = []
-    for idx in indices:
+    world_cam_positions = []
+    
+    print("Logging shared world data...")
+    for idx in tqdm(indices):
         rr.set_time("frame_idx", sequence=idx)
         
-        # Object-centric
-        T_c_o_gt = frame_data[idx]["T_c_o_gt"].copy()
-        T_c_o_gt[:3, 3] *= cfg.scale
-        rr.log("object/camera_gt", rr.Transform3D(translation=T_c_o_gt[:3, 3], mat3x3=T_c_o_gt[:3, :3], relation=rr.TransformRelation.ChildFromParent))
-
-        q_opt, t_opt = pose_params[idx]
-        T_c_o_opt = np.eye(4)
-        T_c_o_opt[:3, :] = pycolmap.Rigid3d(pycolmap.Rotation3d(q_opt), t_opt).matrix()
-        T_c_o_opt_scaled = T_c_o_opt.copy()
-        T_c_o_opt_scaled[:3, 3] *= cfg.scale
-        rr.log("object/camera_opt", rr.Transform3D(translation=T_c_o_opt_scaled[:3, 3], mat3x3=T_c_o_opt_scaled[:3, :3], relation=rr.TransformRelation.ChildFromParent))
-        
-        # World-centric
+        # Camera pose
         T_c_w = frame_data[idx]["T_c_w"]
         T_w_c = np.linalg.inv(T_c_w)
-        rr.log("world/camera", rr.Transform3D(translation=T_w_c[:3, 3], mat3x3=T_w_c[:3, :3]))
+        rr.log("world/camera", rr.Transform3D(translation=T_w_c[:3, 3], mat3x3=T_w_c[:3, :3], relation=rr.TransformRelation.ParentFromChild))
+        world_cam_positions.append(T_w_c[:3, 3])
         
-        T_w_o_opt = T_w_c @ T_c_o_opt_scaled
-        rr.log("world/object", rr.Transform3D(translation=T_w_o_opt[:3, 3], mat3x3=T_w_o_opt[:3, :3]))
-        world_obj_positions.append(T_w_o_opt[:3, 3])
-
-        # GT World-centric
+        # GT Object pose
         T_w_o_gt = data_loader.get_obj_pose(idx)
-        rr.log("world/object_gt", rr.Transform3D(translation=T_w_o_gt[:3, 3], mat3x3=T_w_o_gt[:3, :3]))
+        rr.log("world/object_gt", rr.Transform3D(translation=T_w_o_gt[:3, 3], mat3x3=T_w_o_gt[:3, :3], relation=rr.TransformRelation.ParentFromChild))
         gt_world_obj_positions.append(T_w_o_gt[:3, 3])
         
+        # Camera views (the actual image from the camera)
         K = frame_data[idx]["K"]
         img = frame_data[idx]["image"]
-        rr.log("world/camera/view", rr.Pinhole(resolution=(img.shape[1], img.shape[0]), image_from_camera=K, camera_xyz=rr.ViewCoordinates.RDF))
+        rr.log("world/camera/view", rr.Pinhole(resolution=(img.shape[1], img.shape[0]), image_from_camera=K, camera_xyz=rr.ViewCoordinates.RDF, image_plane_distance=0.1))
         rr.log("world/camera/view", rr.Image(img).compress(jpeg_quality=50))
 
-        rr.log("object/camera_opt/view", rr.Pinhole(resolution=(img.shape[1], img.shape[0]), image_from_camera=K, camera_xyz=rr.ViewCoordinates.RDF))
-        rr.log("object/camera_opt/view", rr.Image(img).compress(jpeg_quality=50))
-
-        # Log feature tracks
+        # Log feature tracks (2D points are scale-independent)
         if idx in idx_to_tracks:
             tinfo = idx_to_tracks[idx]
             if tinfo:
@@ -319,56 +363,110 @@ def main(cfg: Config):
                 uvs = [t[1] for t in tinfo]
                 # Green if triangulated, red otherwise
                 colors = [(0, 255, 0) if tid in pts3D_init else (255, 0, 0) for tid in tids]
-                rr.log("object/camera_opt/view/tracks", rr.Points2D(uvs, colors=colors, radii=2))
+                rr.log("world/camera/view/tracks", rr.Points2D(uvs, colors=colors, radii=2))
 
-    if world_obj_positions:
-        rr.log("world/trajectory", rr.LineStrips3D([np.array(world_obj_positions)], colors=[(255, 255, 0)], radii=0.002), static=True)
-    
-    if gt_world_obj_positions:
-        rr.log("world/gt_trajectory", rr.LineStrips3D([np.array(gt_world_obj_positions)], colors=[(255, 0, 0)], radii=0.002), static=True)
+    rr.log("world/trajectory/camera", rr.LineStrips3D([np.array(world_cam_positions)], colors=[(0, 0, 255)], radii=0.005), static=True)
+    rr.log("world/trajectory/gt", rr.LineStrips3D([np.array(gt_world_obj_positions)], colors=[(255, 0, 0)], radii=0.005), static=True)
 
-    # Save Results
-    out_dir = Path(cfg.output_dir) / cfg.data_seq
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save optimized 3D points
-    res_points = np.array(list(point_params.values())) * cfg.scale
-    res_tids = np.array(list(point_params.keys()))
-    
-    # Save optimized poses (q, t) - note: these are unscaled raw BA outputs
-    # Scaling is usually applied after loading if needed, or we could save scaled ones.
-    # To be consistent with visual, let's save scaled translations.
-    res_frame_indices = np.array(list(pose_params.keys()))
-    res_pose_vectors = []
-    for idx in res_frame_indices:
-        q, t = pose_params[idx]
-        t_scaled = t * cfg.scale
-        res_pose_vectors.append(np.concatenate([q, t_scaled]))
-    res_pose_vectors = np.array(res_pose_vectors)
-    
-    np.savez(out_dir / "reconstruction.npz", 
-             points=res_points, 
-             tids=res_tids, 
-             frame_indices=res_frame_indices,
-             pose_vectors=res_pose_vectors)
-    
-    # Save a PLY file for easy visualization
-    if len(res_points) > 0:
-        with open(out_dir / "reconstruction.ply", "w") as f:
-            f.write("ply\n")
-            f.write("format ascii 1.0\n")
-            f.write(f"element vertex {len(res_points)}\n")
-            f.write("property float x\n")
-            f.write("property float y\n")
-            f.write("property float z\n")
-            f.write("property uchar red\n")
-            f.write("property uchar green\n")
-            f.write("property uchar blue\n")
-            f.write("end_header\n")
-            for p in res_points:
-                f.write(f"{p[0]} {p[1]} {p[2]} 0 255 0\n")
+    # --- Scale-Specific BA Visualization ---
+    for s in cfg.scale:
+        s_name = f"s{s:.2f}".replace(".", "_")
+        print(f"Logging visualization for scale {s}...")
+
+        # Camera-centric BA results
+        rr.log(f"object/points_{s_name}/init", rr.Points3D(np.array(list(pts3D_init.values())) * s, colors=[(100, 100, 100)], radii=0.002), static=True)
+        rr.log(f"object/points_{s_name}/optimized", rr.Points3D(np.array(list(point_params.values())) * s, colors=[(0, 255, 0)], radii=0.003), static=True)
+
+        # World-centric points (relative to the moving object frame)
+        rr.log(f"world/object_{s_name}/points", rr.Points3D(np.array(list(point_params.values())) * s, colors=[(0, 255, 0)], radii=0.003), static=True)
+
+        world_obj_positions = []
+        object_cam_gt_positions = []
+        object_cam_opt_positions = []
+
+        for idx in indices:
+            rr.set_time("frame_idx", sequence=idx)
             
-    print(f"Final reconstruction saved to {out_dir}")
+            # Object-centric camera hypotheses
+            T_c_o_gt = frame_data[idx]["T_c_o_gt"].copy()
+            T_c_o_gt[:3, 3] *= s
+            rr.log(f"object/camera_gt_{s_name}", rr.Transform3D(translation=T_c_o_gt[:3, 3], mat3x3=T_c_o_gt[:3, :3], relation=rr.TransformRelation.ChildFromParent))
+            # Wireframe frustum for GT
+            rr.log(f"object/camera_gt_{s_name}/frustum", rr.Pinhole(resolution=(img.shape[1], img.shape[0]), image_from_camera=K, camera_xyz=rr.ViewCoordinates.RDF, image_plane_distance=0.05))
+
+            q_opt, t_opt = pose_params[idx]
+            T_c_o_opt = np.eye(4)
+            T_c_o_opt[:3, :] = pycolmap.Rigid3d(pycolmap.Rotation3d(q_opt), t_opt).matrix()
+            T_c_o_opt_scaled = T_c_o_opt.copy()
+            T_c_o_opt_scaled[:3, 3] *= s
+            rr.log(f"object/camera_opt_{s_name}", rr.Transform3D(translation=T_c_o_opt_scaled[:3, 3], mat3x3=T_c_o_opt_scaled[:3, :3], relation=rr.TransformRelation.ChildFromParent))
+            # Wireframe frustum for Opt
+            rr.log(f"object/camera_opt_{s_name}/frustum", rr.Pinhole(resolution=(img.shape[1], img.shape[0]), image_from_camera=K, camera_xyz=rr.ViewCoordinates.RDF, image_plane_distance=0.05))
+            
+            # World-centric object hypotheses
+            T_c_w = frame_data[idx]["T_c_w"]
+            T_w_c = np.linalg.inv(T_c_w)
+            T_w_o_opt = T_w_c @ T_c_o_opt_scaled
+            world_obj_positions.append(T_w_o_opt[:3, 3])
+            
+            # Trajectories for object-centric view
+            T_o_c_gt = np.linalg.inv(T_c_o_gt)
+            object_cam_gt_positions.append(T_o_c_gt[:3, 3])
+            
+            T_o_c_opt = np.linalg.inv(T_c_o_opt_scaled)
+            object_cam_opt_positions.append(T_o_c_opt[:3, 3])
+            
+            # Note: world/camera and world/object_gt are logged in the pre-loop.
+            # We log the specific world hypothesis for this scale here:
+            rr.log(f"world/object_{s_name}", rr.Transform3D(translation=T_w_o_opt[:3, 3], mat3x3=T_w_o_opt[:3, :3], relation=rr.TransformRelation.ParentFromChild))
+
+        if world_obj_positions:
+            rr.log(f"world/trajectory/optimized_{s_name}", rr.LineStrips3D([np.array(world_obj_positions)], colors=[(255, 255, 0)], radii=0.004), static=True)
+
+        if object_cam_gt_positions:
+            rr.log(f"object/trajectory/camera_gt_{s_name}", rr.LineStrips3D([np.array(object_cam_gt_positions)], colors=[(255, 0, 0)], radii=0.005), static=True)
+        if object_cam_opt_positions:
+            rr.log(f"object/trajectory/camera_opt_{s_name}", rr.LineStrips3D([np.array(object_cam_opt_positions)], colors=[(0, 0, 255)], radii=0.005), static=True)
+
+        # Save Results per scale
+        out_dir = Path(cfg.output_dir) / cfg.data_seq
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save optimized 3D points
+        res_points = np.array(list(point_params.values())) * s
+        res_tids = np.array(list(point_params.keys()))
+        
+        res_frame_indices = np.array(list(pose_params.keys()))
+        res_pose_vectors = []
+        for idx in res_frame_indices:
+            q, t = pose_params[idx]
+            t_scaled = t * s
+            res_pose_vectors.append(np.concatenate([q, t_scaled]))
+        res_pose_vectors = np.array(res_pose_vectors)
+        
+        np.savez(out_dir / f"reconstruction_{s_name}.npz", 
+                 points=res_points, 
+                 tids=res_tids, 
+                 frame_indices=res_frame_indices,
+                 pose_vectors=res_pose_vectors)
+        
+        # Save a PLY file for easy visualization
+        if len(res_points) > 0:
+            with open(out_dir / f"reconstruction_{s_name}.ply", "w") as f:
+                f.write("ply\n")
+                f.write("format ascii 1.0\n")
+                f.write(f"element vertex {len(res_points)}\n")
+                f.write("property float x\n")
+                f.write("property float y\n")
+                f.write("property float z\n")
+                f.write("property uchar red\n")
+                f.write("property uchar green\n")
+                f.write("property uchar blue\n")
+                f.write("end_header\n")
+                for p in res_points:
+                    f.write(f"{p[0]} {p[1]} {p[2]} 0 255 0\n")
+                
+        print(f"Scale {s} reconstruction saved to {out_dir}")
 
 if __name__ == "__main__":
     cfg = tyro.cli(Config)
