@@ -1,7 +1,8 @@
 import dataclasses
 import torch
 from pathlib import Path
-from .gs_rendering import render_2dgs, render_2dgs_full, render_2dgs_visiblity
+from .gs_rendering import render_2dgs, render_2dgs_full, render_2dgs_visiblity, render_3dgs
+from .gs_rendering_gsplat import render_2dgs as render_2dgs_gsplat, render_3dgs as render_3dgs_gsplat
 
 
 @dataclasses.dataclass
@@ -32,7 +33,23 @@ class GSParam:
 
     def render(self, viewmat, K, width, height, mode: str = "normal", near_plane: float = 0.01,
                far_plane: float = 100.0, scaling_modifier: float = 1.0,
-               bg=torch.zeros(3)):
+               bg=torch.zeros(3), backend: str = "inria"):
+        if backend == "gsplat":
+            if mode == "normal":
+                return render_2dgs_gsplat(
+                    self.means, self.quats, self.scales, self.colors, self.opacity,
+                    viewmat, K, width, height, near_plane, far_plane,
+                    scaling_modifier, bg
+                )
+            elif mode == "3dgs":
+                return render_3dgs_gsplat(
+                    self.means, self.quats, self.scales, self.colors, self.opacity,
+                    viewmat, K, width, height, near_plane, far_plane,
+                    scaling_modifier, bg
+                )
+            else:
+                raise NotImplementedError(f"Mode {mode} not implemented for gsplat backend")
+
         if mode == "normal":
             return render_2dgs(
                 self.means, self.quats, self.scales, self.colors, self.opacity,
@@ -47,6 +64,12 @@ class GSParam:
             )
         elif mode == "visibility":
             return render_2dgs_visiblity(
+                self.means, self.quats, self.scales, self.colors, self.opacity,
+                viewmat, K, width, height, near_plane, far_plane,
+                scaling_modifier, bg
+            )
+        elif mode == "3dgs":
+            return render_3dgs(
                 self.means, self.quats, self.scales, self.colors, self.opacity,
                 viewmat, K, width, height, near_plane, far_plane,
                 scaling_modifier, bg

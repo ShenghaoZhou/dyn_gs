@@ -2,9 +2,9 @@ from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRas
 import math
 import torch
 
-# from diff_gaussian_rasterization import GaussianRasterizationSettings as DGSRasterizationSettings
-# from diff_gaussian_rasterization import GaussianRasterizer as DGSRasterizer
-# from diff_gaussian_rasterization import rasterize_gaussians as raterize_gaussians_3dgs
+from diff_gaussian_rasterization import GaussianRasterizationSettings as DGSRasterizationSettings
+from diff_gaussian_rasterization import GaussianRasterizer as DGSRasterizer
+from diff_gaussian_rasterization import rasterize_gaussians as raterize_gaussians_3dgs
 def getProjectionMatrix(znear, zfar, fovX, fovY, device="cpu"):
     """identical to the one in utils/graphics_utils.py, but with device argument
     """
@@ -242,62 +242,73 @@ def render_3dgs(gs_means, gs_rotations, gs_scales, gs_colors, gs_opacity,
                 viewmat, K, width, height,  near_plane: float = 0.01,
                 far_plane: float = 100.0, scaling_modifier: float = 1.0,
                 bg=torch.zeros(3)):
+    from diff_gaussian_rasterization import rasterize_gaussians
     device = gs_means.device
+    
+    # Input validation and clamping to prevent numerical issues
+    gs_means = gs_means.contiguous()
+    gs_opacity = torch.clamp(gs_opacity, 0.0, 1.0).contiguous()
+    gs_scales = gs_scales.contiguous()
+    gs_rotations = gs_rotations.contiguous()
+    gs_colors = gs_colors.contiguous()
 
     FoVx = 2 * math.atan(width / (2 * K[0, 0].item()))
     FoVy = 2 * math.atan(height / (2 * K[1, 1].item()))
     tanfovx = math.tan(FoVx * 0.5)
     tanfovy = math.tan(FoVy * 0.5)
     bg = bg.to(device)
-    world_view_transform = viewmat.transpose(0, 1).to(device)
-    cam_centre = world_view_transform.detach().inverse()[3, :3]
+    
+    world_view_transform = viewmat.transpose(0, 1).to(device).contiguous()
+    cam_centre = world_view_transform.detach().inverse()[3, :3].contiguous()
     projection_matrix = getProjectionMatrix(
-        znear=near_plane, zfar=far_plane, fovX=FoVx, fovY=FoVy, device=device).transpose(0, 1).to(device)
-
+        znear=near_plane, zfar=far_plane, fovX=FoVx, fovY=FoVy, device=device).transpose(0, 1).to(device).contiguous()
+    
     means2D = torch.zeros_like(gs_means, requires_grad=True, device=device)
-    max_sh_degree = 3
-    f_rest = torch.zeros(
-        gs_colors.shape[0],
-        (max_sh_degree + 1) * (max_sh_degree + 1) - 1,
-        3,
-        device="cuda",
-    )
+    
+    # Using degree 0 as default
+    max_sh_degree = 0
+    empty_tensor = torch.Tensor([]).to(device)
 
     raster_settings = DGSRasterizationSettings(
-        int(height),
-        int(width),
-        tanfovx,
-        tanfovy,
-        bg,
-        scaling_modifier,
-        projection_matrix,
-        max_sh_degree,
-        cam_centre,
-        False,
-        False,
+        image_height=int(height),
+        image_width=int(width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg,
+        scale_modifier=scaling_modifier,
+        projmatrix=projection_matrix,
+        sh_degree=max_sh_degree,
+        campos=cam_centre,
+        prefiltered=False,
+        debug=False,
     )
-    # color, invdepth, mainGaussID, radii = raterize_gaussians_3dgs(
-    #     means3D=gs_means,
-    #     means2D=means2D,
-    #     dc=gs_colors,
-    #     sh=3,
-    #     colors_precomp=torch.Tensor([]).cuda(),
-    #     opacities=gs_opacity,
-    #     scales=gs_scales,
-    #     rotations=gs_rotations,
-    #     cov3Ds_precomp=torch.Tensor([]).cuda(),
-    #     viewmatrix=world_view_transform,
-    #     raster_settings=raster_settings,
-    # )
-    rastetizer = DGSRasterizer(raster_settings=raster_settings)
-    color, invdepth, mainGaussID, radii = rastetizer(
-        gs_means,
-        means2D,
-        gs_opacity,
-        gs_colors,
-        f_rest,
-        gs_scales,
-        gs_rotations,
-        world_view_transform
+
+    # Call directly to ensure precise argument passing
+    color, invdepth, mainGaussID, radii = rasterize_gaussians(
+        means3D=gs_means,
+        means2D=means2D,
+        dc=gs_colors,         # [N, 3] or [N, 1, 3]
+        sh=empty_tensor,      # Empty if degree 0
+        colors_precomp=empty_tensor,
+        opacities=gs_opacity,
+        scales=gs_scales,
+        rotations=gs_rotations,
+        cov3Ds_precomp=empty_tensor,
+        viewmatrix=world_view_transform,
+        raster_settings=raster_settings
     )
-    return color
+    
+    # Synchronize to catch CUDA errors early
+    torch.cuda.synchronize()
+    
+    render_depth = 1.0 / (invdepth + 1e-8)
+    
+    return color, render_depth, torch.zeros_like(color)
+
+
+
+
+
+
+
+

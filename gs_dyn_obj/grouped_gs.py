@@ -27,6 +27,7 @@ In this approach, we may even model "non-rigid" motion, as between frames, ridig
 """
 import numpy as np
 import torch
+import torch.nn.functional as F
 from .utils.vis import vis_2dgs_rerun
 from .gs_rendering import render_2dgs, render_3dgs
 from .utils.init import unproject_depth, d2n_tblr
@@ -54,23 +55,53 @@ class GaussianSuperPrimitive:
         depth = torch.from_numpy(depth.copy()).float()
         image = torch.from_numpy(image.copy()).float()
         mask = torch.from_numpy(mask.copy()).bool()
+        
+        # Filter mask by depth validity
+        mask = mask & (depth > 0)
+        
         K = torch.from_numpy(K.copy()).float()
         extrin = torch.from_numpy(extrin.copy()).float()
         xyz = unproject_depth(depth, K, depth.shape[0], depth.shape[1])
 
-        means = xyz[mask].reshape(-1, 3)
-        colors = image[mask].reshape(-1, 3) / 255.0
         f = (0.5 * (K[0, 0] + K[1, 1]))
-        sizes = depth[mask] / f
+        
         if normal is None:
             normal_from_depth, valid_mask = d2n_tblr(
                 xyz.permute((2, 0, 1)).unsqueeze(0))
-            normal = normal_from_depth[..., mask].view(-1, 3)
-            normal = normal / torch.norm(normal, dim=1, keepdim=True)
+            # Further filter mask by normal validity (optional, but safer)
+            # Get normals and validity mask from depth
+            # We DONT filter the initialization mask by valid_mask here, as it is too aggressive
+            # and discards valid object parts that are thin (like fingers) or near edges.
+            vm = valid_mask.squeeze(0).squeeze(0)
+            
+            means = xyz[mask].reshape(-1, 3)
+            colors = image[mask].reshape(-1, 3) / 255.0
+            sizes = depth[mask] / f # focal length based sizing
+            
+            # Extract normals for all masked pixels.
+            # d2n_tblr currently produce +Z for surfaces facing the camera (+Z is forward in RDF).
+            # We will flip this to -Z so they point at the camera.
+            normal = normal_from_depth[0, :, mask].transpose(0, 1)
+            
+            # Fallback for boundary pixels where d2n_tblr failed to find neighbors.
+            norm_mags = torch.norm(normal, dim=1)
+            invalid_nn = norm_mags < 1e-6
+            if invalid_nn.any():
+                normal[invalid_nn] = torch.tensor([0.0, 0.0, -1.0], device=normal.device)
+            
+            # Flip and normalize to ensure they are front-facing unit vectors.
+            normal = -normal
+            normal = F.normalize(normal, dim=1)
         else:
             normal = torch.from_numpy(
-                normal.copy()).float()[mask].reshape(-1, 3)
-            normal = normal / torch.norm(normal, dim=1, keepdim=True)
+                normal.copy()).float()
+            
+            means = xyz[mask].reshape(-1, 3)
+            colors = image[mask].reshape(-1, 3) / 255.0
+            sizes = depth[mask] / f
+            normal = normal[mask].reshape(-1, 3)
+            normal = F.normalize(normal, dim=1)
+
         ref_axis1 = torch.randn(normal.shape[0], 3)
         ref_axis1 = ref_axis1 / torch.norm(ref_axis1, dim=1, keepdim=True)
         rotation_axis1 = ref_axis1 - \
@@ -813,10 +844,14 @@ class GaussianSuperPrimitive3D:
         extrin = torch.from_numpy(extrin.copy()).float()
         xyz = unproject_depth(depth, K, depth.shape[0], depth.shape[1])
 
+        # Filter mask by valid depth
+        valid_depth_mask = depth > 0
+        mask = mask & valid_depth_mask
+        
         means = xyz[mask].reshape(-1, 3)
         colors = image[mask].reshape(-1, 3) / 255.0
         f = (0.5 * (K[0, 0] + K[1, 1]))
-        sizes = depth[mask] / f
+        sizes = (depth[mask] / f).clamp(min=1e-6) # Clamp small scales
 
         normal_from_depth, valid_mask = d2n_tblr(
             xyz.permute((2, 0, 1)).unsqueeze(0))
@@ -935,7 +970,7 @@ class GaussianSuperPrimitive3D:
 
                 delta_quat = matrix_to_quaternion(rot_mat).unsqueeze(0)
                 new_quats = quaternion_multiply(delta_quat, base_quats)
-                render_image = render_3dgs(
+                render_image, _, _ = render_3dgs(
                     new_means, new_quats, self.gs_params.scales,
                     self.gs_params.colors, self.gs_params.opacity,
                     viewmat=extrin_next,
@@ -1151,7 +1186,7 @@ class GaussianSuperPrimitive3D:
 
                 delta_quat = matrix_to_quaternion(rot_mat).unsqueeze(0)
                 new_quats = quaternion_multiply(delta_quat, base_quats)
-                render_image = render_3dgs(
+                render_image, _, _ = render_3dgs(
                     new_means, new_quats, self.gs_params.scales,
                     self.gs_params.colors, self.gs_params.opacity,
                     viewmat=extrin_next,

@@ -12,6 +12,8 @@ from pytorch3d.transforms.so3 import so3_exp_map
 import rerun as rr
 import io
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 class ObjectGS: 
@@ -132,6 +134,9 @@ class ObjectGS:
             
             current_loss = loss.item()
             losses.append(current_loss)
+            
+            if step % 50 == 0:
+                 print(f"[{self.__class__.__name__}] Step {step}/{num_steps} - Loss: {current_loss:.6f}")
             
             if current_loss < best_loss:
                 best_loss = current_loss
@@ -278,6 +283,9 @@ class ObjectGS:
             
             current_loss = loss.item()
             losses.append(current_loss)
+            
+            if step % 50 == 0:
+                 print(f"[{self.__class__.__name__}:pose] Step {step}/{num_steps} - Loss: {current_loss:.6f}")
             
             if current_loss < best_loss:
                 best_loss = current_loss
