@@ -4,7 +4,9 @@ We use a set of GS to model a rigid object.
 
 import numpy as np
 import torch
-from .gs_rendering import render_2dgs
+import torch.nn.functional as F
+from .gs_rendering import render_2dgs, render_3dgs
+from .gs_rendering_gsplat import render_2dgs as render_2dgs_gsplat, render_3dgs as render_3dgs_gsplat
 from .gs_param import GSParam
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply
 from .utils.ssim import image_loss
@@ -25,7 +27,9 @@ class ObjectGS:
     def optimize_wrt_image(self, image, K, T_C_O_init, 
                            lr=1e-3, num_steps=100, rr_vis=False,
                            static_bg_img=None, mask=None, hand_mask=None,
-                           near_plane=0.01, far_plane=10.0):
+                           near_plane=0.01, far_plane=10.0,
+                           backend: str = "inria",
+                           mask_loss_weight: float = 0.0):
         """Optimize T_C_O by transforming GS primitives.
            This follows the logic from grouped_gs.py:track_to_frame_with_static_bg.
            It transforms GS means and quats explicitly.
@@ -108,23 +112,42 @@ class ObjectGS:
             delta_quat = matrix_to_quaternion(rot_mat).unsqueeze(0)
             new_quats = quaternion_multiply(delta_quat, quats_c_init)
             
-            render_image, render_depth, render_normal = render_2dgs(
-                new_means, new_quats, self.gs_params.scales,
-                self.gs_params.colors, self.gs_params.opacity,
-                viewmat=torch.eye(4, device=device),
-                K=K_t,
-                width=image_gt.shape[2], height=image_gt.shape[1],
-                bg=bg,
-                near_plane=near_plane,
-                far_plane=far_plane
-            )
+            if backend == "gsplat":
+                render_image, render_depth, render_normal, render_mask = render_2dgs_gsplat(
+                    new_means, new_quats, self.gs_params.scales,
+                    self.gs_params.colors, self.gs_params.opacity,
+                    viewmat=torch.eye(4, device=device),
+                    K=K_t,
+                    width=image_gt.shape[2], height=image_gt.shape[1],
+                    bg=bg,
+                    near_plane=near_plane,
+                    far_plane=far_plane
+                )
+            else:
+                render_image, render_depth, render_normal, render_mask = render_2dgs(
+                    new_means, new_quats, self.gs_params.scales,
+                    self.gs_params.colors, self.gs_params.opacity,
+                    viewmat=torch.eye(4, device=device),
+                    K=K_t,
+                    width=image_gt.shape[2], height=image_gt.shape[1],
+                    bg=bg,
+                    near_plane=near_plane,
+                    far_plane=far_plane
+                )
             
             # Alpha blend with static background if available
             if static_bg_t is not None:
                 mask_bg = (render_image == bg[:, None, None]).all(dim=0)
                 render_image[:, mask_bg] = static_bg_t[:, mask_bg]
             
+            # Image loss
             loss = image_loss(render_image * valid_loss_mask, image_gt * valid_loss_mask)
+            
+            # Mask loss
+            if mask_loss_weight > 0 and mask is not None:
+                gt_mask = mask.float().to(device).unsqueeze(0)
+                mask_loss = F.mse_loss(render_mask, gt_mask)
+                loss = loss + mask_loss_weight * mask_loss
             
             if torch.isnan(loss):
                 break
@@ -184,7 +207,9 @@ class ObjectGS:
     def optimize_pose_wrt_image(self, image, K, T_C_O_init, 
                              lr=1e-3, num_steps=100, rr_vis=False,
                              static_bg_img=None, mask=None, hand_mask=None,
-                             near_plane=0.01, far_plane=10.0):
+                             near_plane=0.01, far_plane=10.0,
+                             backend: str = "inria",
+                             mask_loss_weight: float = 0.0):
         """Optimize T_C_O directly as a viewmat.
            The object remains the same (no need to compute center and quat for points).
            Each step updates the viewmat to view the object from different angles.
@@ -256,24 +281,41 @@ class ObjectGS:
             
             current_T_C_O = T_delta @ T_C_O_t
             
-            # Render using current_T_C_O as viewmat
-            # Object parameters remain exactly as initialized
-            render_image, _, _ = render_2dgs(
-                self.gs_params.means, self.gs_params.quats, self.gs_params.scales,
-                self.gs_params.colors, self.gs_params.opacity,
-                viewmat=current_T_C_O,
-                K=K_t,
-                width=image_gt.shape[2], height=image_gt.shape[1],
-                bg=bg,
-                near_plane=near_plane,
-                far_plane=far_plane
-            )
+            if backend == "gsplat":
+                render_image, _, _, render_mask = render_2dgs_gsplat(
+                    self.gs_params.means, self.gs_params.quats, self.gs_params.scales,
+                    self.gs_params.colors, self.gs_params.opacity,
+                    viewmat=current_T_C_O,
+                    K=K_t,
+                    width=image_gt.shape[2], height=image_gt.shape[1],
+                    bg=bg,
+                    near_plane=near_plane,
+                    far_plane=far_plane
+                )
+            else:
+                render_image, _, _, render_mask = render_2dgs(
+                    self.gs_params.means, self.gs_params.quats, self.gs_params.scales,
+                    self.gs_params.colors, self.gs_params.opacity,
+                    viewmat=current_T_C_O,
+                    K=K_t,
+                    width=image_gt.shape[2], height=image_gt.shape[1],
+                    bg=bg,
+                    near_plane=near_plane,
+                    far_plane=far_plane
+                )
             
             if static_bg_t is not None:
                 mask_bg = (render_image == bg[:, None, None]).all(dim=0)
                 render_image[:, mask_bg] = static_bg_t[:, mask_bg]
             
+            # Image loss
             loss = image_loss(render_image * valid_loss_mask, image_gt * valid_loss_mask)
+            
+            # Mask loss
+            if mask_loss_weight > 0 and mask is not None:
+                gt_mask = mask.float().to(device).unsqueeze(0)
+                mask_loss = F.mse_loss(render_mask, gt_mask)
+                loss = loss + mask_loss_weight * mask_loss
             
             if torch.isnan(loss):
                 break

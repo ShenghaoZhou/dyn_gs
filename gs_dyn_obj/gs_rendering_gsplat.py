@@ -76,10 +76,12 @@ def render_2dgs(gs_means, gs_rotations, gs_scales, gs_colors, gs_opacity,
     
     # Handle background
     bg = bg.to(device)
+    # Accumulated alpha
     alphas = render_alphas[0, 0].permute(2, 0, 1)
+    
     img = img + (1 - alphas) * bg[:, None, None]
     
-    return img, depth, normal
+    return img, depth, normal, alphas
 
 def render_3dgs(gs_means, gs_rotations, gs_scales, gs_colors, gs_opacity,
                 viewmat, K, width, height, near_plane: float = 0.01,
@@ -118,11 +120,9 @@ def render_3dgs(gs_means, gs_rotations, gs_scales, gs_colors, gs_opacity,
     
     # Handle background for color
     bg = bg.to(device)
+    # Return alpha as well
     alphas = render_alphas[0, 0].permute(2, 0, 1)
-    img = img + (1 - alphas) * bg[:, None, None]
-    
-    # 3DGS doesn't have native normals; returning zeros to match expected interface
-    return img, depth, torch.zeros_like(img)
+    return img, depth, torch.zeros_like(img), alphas
 
 def render_2dgs_full(gs_means, gs_rotations, gs_scales, gs_colors, gs_opacity,
                      viewmat, K, width, height, near_plane: float = 0.01,
