@@ -28,13 +28,13 @@ from utils.loss_utils import ssim, lncc, get_img_grad_weight
 @dataclass
 class MappingConfig:
     device: str = "cuda"
-    lr_means: float = 1e-3
+    lr_means: float = 5e-4
     lr_quats: float = 1e-3
     lr_scales: float = 5e-3
     lr_colors: float = 2.5e-3
     lr_opacity: float = 5e-2
     
-    num_steps_per_frame: int = 100
+    num_steps_per_frame: int = 50
     pyr_levels: int = 2
     pyr_interval: int = 30
     
@@ -44,11 +44,10 @@ class MappingConfig:
     
     # Loss Weights
     lambda_dssim: float = 0.5
-    single_view_weight: float = 0.015
-    multi_view_photo_weight: float = 10.0
-    multi_view_ncc_weight: float = 0.5
-    multi_view_geo_weight: float = 10.0
-    scale_loss_weight: float = 100.0
+    lambda_sv: float = 0.015
+    multi_view_photo_weight: float = 1.0
+    multi_view_ncc_weight: float = 1.0
+    multi_view_geo_weight: float = 0.5
     
     use_mask_loss: bool = True
     mask_loss_weight: float = 1.0
@@ -66,6 +65,14 @@ class MappingConfig:
     far_plane: float = 100.0
     
     use_pgsr: bool = True
+    fix_color_and_scales: bool = False
+    
+    # Virtual Camera
+    use_virtul_cam: bool = True
+    virtul_cam_prob: float = 0.5
+    multi_view_max_dis: float = 0.1
+    
+    use_ray_dist: bool = True
 
 class MiniCam:
     def __init__(self, K, extrin, width, height, ncc_scale=1.0):
@@ -132,7 +139,7 @@ def get_depth_normal(d, K):
     v1 = torch.stack([torch.ones_like(dz_dx), torch.zeros_like(dz_dx), dz_dx], dim=-1)
     v2 = torch.stack([torch.zeros_like(dz_dy), torch.ones_like(dz_dy), dz_dy], dim=-1)
     n = torch.cross(v1, v2, dim=-1)
-    return F.normalize(n, dim=-1).permute(2, 0, 1)
+    return -F.normalize(n, dim=-1).permute(2, 0, 1) # Point towards camera
 
 def sample_patches(img, p):
     H, W = img.shape[-2:]
@@ -215,15 +222,23 @@ class GSMapping:
         self.gs_params = initial_gs
         self.data_queue = mp.Queue(maxsize=5)
         self.stop_event = mp.Event()
+        self.last_finished_frame = -1
 
     def setup_optimizer(self):
-        self.optimizer = torch.optim.Adam([
-            {"params": [self.gs_params.means], "lr": self.cfg.lr_means},
+        params = [
             {"params": [self.gs_params.quats], "lr": self.cfg.lr_quats},
-            {"params": [self.gs_params.scales], "lr": self.cfg.lr_scales},
-            {"params": [self.gs_params.colors], "lr": self.cfg.lr_colors},
             {"params": [self.gs_params.opacity], "lr": self.cfg.lr_opacity},
-        ])
+        ]
+        if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+            params.append({"params": [self.gs_params.ray_dist], "lr": self.cfg.lr_means})
+        else:
+            params.append({"params": [self.gs_params.means], "lr": self.cfg.lr_means})
+            
+        if not self.cfg.fix_color_and_scales:
+            params.append({"params": [self.gs_params.scales], "lr": self.cfg.lr_scales})
+            params.append({"params": [self.gs_params.colors], "lr": self.cfg.lr_colors})
+        
+        self.optimizer = torch.optim.Adam(params)
 
     def update(self, frame_data):
         cpu_frame_data = {}
@@ -246,11 +261,23 @@ class GSMapping:
         self.gs_params.to(self.device)
         
         # Ensure parameters are optimizable
-        self.gs_params.means.requires_grad = True
+        if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+            self.gs_params.ray_dist.requires_grad = True
+            self.gs_params.means.requires_grad = False
+        else:
+            self.gs_params.means.requires_grad = True
+            if self.gs_params.ray_dist is not None:
+                self.gs_params.ray_dist.requires_grad = False
+            
         self.gs_params.quats.requires_grad = True
-        self.gs_params.scales.requires_grad = True
-        self.gs_params.colors.requires_grad = True
         self.gs_params.opacity.requires_grad = True
+        
+        if self.cfg.fix_color_and_scales:
+            self.gs_params.scales.requires_grad = False
+            self.gs_params.colors.requires_grad = False
+        else:
+            self.gs_params.scales.requires_grad = True
+            self.gs_params.colors.requires_grad = True
         
         self.setup_optimizer()
         self.keyframes = []
@@ -298,6 +325,10 @@ class GSMapping:
                 
                 self.optimizer.zero_grad()
                 
+                if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                    # Update means from rays
+                    self.gs_params.means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
+                
                 render_image, render_depth, render_normal, render_alpha = render_2dgs(
                     self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales),
                     self.gs_params.colors, torch.sigmoid(self.gs_params.opacity),
@@ -310,58 +341,112 @@ class GSMapping:
                 loss_ssim = 1.0 - ssim((render_image * target_mask).unsqueeze(0), (target_image * target_mask).unsqueeze(0))
                 loss_photo = (1.0 - self.cfg.lambda_dssim) * loss_l1 + self.cfg.lambda_dssim * loss_ssim
                 
+                # render_normal is already in camera space from render_2dgs
+                
+                render_alpha_sq = render_alpha.squeeze(0)
                 if self.cfg.use_mask_loss:
-                    loss_mask = F.l1_loss(render_alpha, target_mask.float()) * self.cfg.mask_loss_weight
+                    loss_mask = F.l1_loss(render_alpha_sq, target_mask.float()) * self.cfg.mask_loss_weight
                 else:
-                    loss_mask = F.l1_loss(render_alpha * (~target_mask).float(), torch.zeros_like(render_alpha))
-                
-                loss_scale = self.cfg.scale_loss_weight * torch.exp(self.gs_params.scales).min(dim=-1)[0].mean()
-                
-                depth_norm = get_depth_normal(render_depth, curr_K)
-                img_grad_w = (1.0 - get_img_grad_weight(target_image)).clamp(0, 1).detach() ** 2
-                loss_normal = self.cfg.single_view_weight * (img_grad_w * (depth_norm - render_normal).abs().sum(0)).mean()
-                
-                loss_mv = torch.tensor(0.0, device=self.device)
-                if step >= 30 and self.keyframes:
-                    potential_neighbors = [kf for kf in self.keyframes if np.linalg.norm(kf[0].world_view_transform[3, :3].cpu().numpy() - cam.world_view_transform[3, :3].cpu().numpy()) > self.cfg.multi_view_min_dis]
-                    if potential_neighbors:
-                        selected_neighbors = random.sample(potential_neighbors, min(4, len(potential_neighbors)))
-                        for kf in selected_neighbors:
-                            kf_cam, kf_image_t, kf_image_gray_t, kf_depth_t, kf_mask_t = kf
-                            r_img_nea, r_depth_nea, _, r_alpha_nea = render_2dgs(self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales), self.gs_params.colors, torch.sigmoid(self.gs_params.opacity), viewmat=kf_cam.world_view_transform.t(), K=kf_cam.K, width=kf_cam.width, height=kf_cam.height)
-                            loss_mv += self.cfg.multi_view_photo_weight * F.l1_loss(r_img_nea * kf_mask_t, kf_image_t * kf_mask_t) / len(selected_neighbors)
-                            if self.cfg.use_mask_loss:
-                                loss_mv += self.cfg.mask_loss_weight * F.l1_loss(r_alpha_nea, kf_mask_t.float()) / len(selected_neighbors)
-                            if step >= 60:
-                                d_mask, weights, p_noise = compute_geo_consistency(cam, kf_cam, render_depth, r_depth_nea, self.cfg.multi_view_pixel_noise_th)
-                                if d_mask.any():
-                                    loss_mv += self.cfg.multi_view_geo_weight * (weights * p_noise)[d_mask].mean() / len(selected_neighbors)
+                    loss_mask = F.l1_loss(render_alpha_sq * (~target_mask).float(), torch.zeros_like(render_alpha_sq))
 
-                (loss_photo + loss_mask + loss_scale + loss_normal + loss_mv).backward()
+                # PGSR Losses (Single-view and Multi-view Consistency)
+                loss_sv = torch.tensor(0.0, device=self.device)
+                loss_mv = torch.tensor(0.0, device=self.device)
+                
+                if self.cfg.use_pgsr:
+                    # Single-view Consistency (Normal-Depth)
+                    loss_sv = compute_single_view_loss(
+                        render_normal, render_depth, target_image, cam, 
+                        weight=1.0, 
+                        scale=scale, mask=target_mask
+                    )
+                    
+                    if step >= 30:
+                        # Select keyframes or use virtual camera
+                        potential_neighbors = [kf for kf in self.keyframes if np.linalg.norm(kf[0].world_view_transform[3, :3].cpu().numpy() - cam.world_view_transform[3, :3].cpu().numpy()) > self.cfg.multi_view_min_dis]
+                        
+                        selected_neighbors = []
+                        if potential_neighbors:
+                            selected_neighbors = random.sample(potential_neighbors, min(2, len(potential_neighbors)))
+                        
+                        # Virtual camera logic
+                        if (self.cfg.use_virtul_cam and random.random() < self.cfg.virtul_cam_prob) or not selected_neighbors:
+                            v_cam = gen_virtul_cam(cam, trans_noise=self.cfg.multi_view_max_dis)
+                            # For virtual cam, we use the current frame's data as "neighbor"
+                            # This helps regularize the geometry from novel viewpoints near the current one
+                            selected_neighbors.append((v_cam, image_t, image_gray_t[0], render_depth[0].detach(), mask_t))
+
+                        if selected_neighbors:
+                            # Sample pixels for LNCC
+                            yy, xx = torch.where(target_mask)
+                            if len(yy) > 0:
+                                perm = torch.randperm(len(yy), device=self.device)[:4096]
+                                px, py = xx[perm], yy[perm]
+                                sampled_pixels = torch.stack([px, py], dim=-1).float()
+                                sampled_indices = py * target_image.shape[2] + px
+                                
+                                for kf in selected_neighbors:
+                                    kf_cam, kf_image_t, kf_image_gray_t, kf_depth_t, kf_mask_t = kf
+                                    
+                                    # Render neighbor view
+                                    r_img_nea, r_depth_nea, _, r_alpha_nea = render_2dgs(
+                                        self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales),
+                                        self.gs_params.colors, torch.sigmoid(self.gs_params.opacity),
+                                        viewmat=kf_cam.world_view_transform.t(), K=kf_cam.K, width=kf_cam.width, height=kf_cam.height
+                                    )
+                                    
+                                    # 1. Photometric Loss (L1 + SSIM)
+                                    loss_mv_photo = (1.0 - self.cfg.lambda_dssim) * F.l1_loss(r_img_nea[:, kf_mask_t], kf_image_t[:, kf_mask_t]) + \
+                                                    self.cfg.lambda_dssim * (1.0 - ssim((r_img_nea * kf_mask_t).unsqueeze(0), (kf_image_t * kf_mask_t).unsqueeze(0)))
+                                    loss_mv += self.cfg.multi_view_photo_weight * loss_mv_photo / len(selected_neighbors)
+                                    
+                                    # 2. LNCC Loss (Homography Warp)
+                                    ncc, _ = compute_multi_view_loss(
+                                        image_gray_t, kf_image_gray_t.unsqueeze(0), render_normal, render_depth,
+                                        cam, kf_cam, pixels=sampled_pixels, valid_indices=sampled_indices
+                                    )
+                                    loss_mv += self.cfg.multi_view_ncc_weight * ncc.mean() / len(selected_neighbors)
+                                    
+                                    # 3. Mask Loss on neighbor
+                                    if self.cfg.use_mask_loss:
+                                        loss_mv += self.cfg.mask_loss_weight * F.l1_loss(r_alpha_nea[0], kf_mask_t.float()) / len(selected_neighbors)
+                                    
+                                    # 4. Geometric Consistency (PGSR)
+                                    if step >= 60:
+                                        d_mask, weights, p_noise = compute_geo_consistency(cam, kf_cam, render_depth, r_depth_nea, self.cfg.multi_view_pixel_noise_th)
+                                        if d_mask.any():
+                                            loss_mv += self.cfg.multi_view_geo_weight * (weights * p_noise)[d_mask].mean() / len(selected_neighbors)
+
+                total_loss = loss_photo + loss_mask + self.cfg.lambda_sv * loss_sv + loss_mv
+                total_loss.backward()
                 self.optimizer.step()
                 
             # Maintenance
             if frame_count % self.cfg.kf_every == 0:
                 with torch.no_grad():
                     _, r_depth, _, _ = render_2dgs(self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales), self.gs_params.colors, torch.sigmoid(self.gs_params.opacity), viewmat=T_CO_t, K=K_t, width=W, height=H)
-                self.keyframes.append((cam, image_t.detach(), image_gray_t.detach(), r_depth.detach(), mask_t.detach()))
+                self.keyframes.append((cam, image_t.detach(), image_gray_t[0].detach(), r_depth[0].detach(), mask_t.detach()))
                 if len(self.keyframes) > self.cfg.window_size: self.keyframes.pop(0)
 
             if frame_count > 0 and frame_count % self.cfg.densify_every == 0:
+                before_count = len(self.gs_params.means)
                 self.densify(image_t, depth, mask_t, cam, T_CO_t)
                 self.prune(T_CO_t, cam)
+                after_count = len(self.gs_params.means)
+                print(f"Mapping Frame {frame_count}: GS count {before_count} -> {after_count}")
             
             frame_count += 1
-            if frame_count % 10 == 0:
-                print(f"Mapping Process: Processed {frame_count} frames. GS count: {len(self.gs_params.means)}")
+            self.last_finished_frame = frame_data["frame_idx"]
+            if frame_count % 5 == 0:
+                print(f"Mapping Progress: Processed {frame_count} frames. GS count: {len(self.gs_params.means)}")
 
     def densify(self, image_t, depth_np, mask_t, cam, T_CO_t):
         with torch.no_grad():
             render_image, render_depth, _, _ = render_2dgs(self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales), self.gs_params.colors, torch.sigmoid(self.gs_params.opacity), viewmat=T_CO_t, K=cam.K, width=cam.width, height=cam.height)
             depth_curr_t = torch.from_numpy(depth_np).float().to(self.device)
             overlap_mask = (render_depth[0] > 0) & (depth_curr_t > 0) & mask_t
-            if overlap_mask.sum() > 100:
-                depth_curr_t *= torch.median(render_depth[0][overlap_mask] / depth_curr_t[overlap_mask])
+            # if overlap_mask.sum() > 100:
+            #     depth_curr_t *= torch.median(render_depth[0][overlap_mask] / depth_curr_t[overlap_mask])
             init_proba, penalty = get_lapla_norm(image_t, self.disc_kernel), get_lapla_norm(render_image, self.disc_kernel)
             sample_mask = (torch.rand_like(init_proba) < (init_proba - penalty) * 2.0) & mask_t & (depth_curr_t > 0)
             depth_closer = (depth_curr_t < (render_depth[0] - 0.01)) | (render_depth[0] == 0)
@@ -387,11 +472,31 @@ class GSMapping:
                 new_sizes = (1.0 / torch.sqrt(sampled_init_proba)).clamp(2.0, cam.width / 5.0) * (z / ((fx+fy)/2))
                 new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 2).clamp(1e-6, 1e6))
                 new_opacity = torch.log(torch.tensor(0.1 / (1 - 0.1), device=self.device)).repeat(len(new_means), 1)
+                
                 self.gs_params.means = torch.nn.Parameter(torch.cat([self.gs_params.means.data, new_means], dim=0))
                 self.gs_params.quats = torch.nn.Parameter(torch.cat([self.gs_params.quats.data, new_quats], dim=0))
                 self.gs_params.scales = torch.nn.Parameter(torch.cat([self.gs_params.scales.data, new_scales], dim=0))
                 self.gs_params.colors = torch.nn.Parameter(torch.cat([self.gs_params.colors.data, new_colors], dim=0))
                 self.gs_params.opacity = torch.nn.Parameter(torch.cat([self.gs_params.opacity.data, new_opacity], dim=0))
+                
+                if self.cfg.use_ray_dist:
+                    # Initialize rays for new points
+                    new_ray_o = T_OC_t[:3, 3].view(1, 3).repeat(len(new_means), 1)
+                    # new_ray_d in camera space
+                    new_ray_d_c = F.normalize(pts_c, dim=1)
+                    # new_ray_d in object space
+                    new_ray_d_o = F.normalize(torch.einsum('ij,nj->ni', T_OC_t[:3, :3], new_ray_d_c), dim=1)
+                    new_ray_dist = torch.norm(pts_c, dim=-1, keepdim=True)
+                    
+                    if self.gs_params.ray_o is not None:
+                        self.gs_params.ray_o = torch.cat([self.gs_params.ray_o, new_ray_o], dim=0)
+                        self.gs_params.ray_d = torch.cat([self.gs_params.ray_d, new_ray_d_o], dim=0)
+                        self.gs_params.ray_dist = torch.nn.Parameter(torch.cat([self.gs_params.ray_dist.data, new_ray_dist], dim=0))
+                    else:
+                        self.gs_params.ray_o = new_ray_o
+                        self.gs_params.ray_d = new_ray_d_o
+                        self.gs_params.ray_dist = torch.nn.Parameter(new_ray_dist)
+
                 self.setup_optimizer()
 
     def prune(self, T_CO_t, cam):
@@ -399,13 +504,23 @@ class GSMapping:
             means_c = torch.einsum('ij,nj->ni', T_CO_t[:3, :3], self.gs_params.means) + T_CO_t[:3, 3]
             dist = means_c[:, 2].clamp_min(0.01) 
             screen_size = cam.K[0, 0] * torch.exp(self.gs_params.scales).max(dim=-1)[0] / dist
-            valid_mask = (torch.sigmoid(self.gs_params.opacity.squeeze(-1)) > self.cfg.prune_opacity_th) & (screen_size < self.cfg.prune_screen_size_th * cam.width)
+            opacity = torch.sigmoid(self.gs_params.opacity.squeeze(-1))
+            valid_mask = (opacity > self.cfg.prune_opacity_th)
+            valid_mask &= (screen_size < self.cfg.prune_screen_size_th)
+            valid_mask &= (dist > self.cfg.near_plane) & (dist < self.cfg.far_plane)
+
             if valid_mask.sum() == 0: valid_mask = torch.ones_like(valid_mask)
             self.gs_params.means = torch.nn.Parameter(self.gs_params.means[valid_mask])
             self.gs_params.quats = torch.nn.Parameter(self.gs_params.quats[valid_mask])
             self.gs_params.scales = torch.nn.Parameter(self.gs_params.scales[valid_mask])
             self.gs_params.colors = torch.nn.Parameter(self.gs_params.colors[valid_mask])
             self.gs_params.opacity = torch.nn.Parameter(self.gs_params.opacity[valid_mask])
+            
+            if self.gs_params.ray_dist is not None:
+                self.gs_params.ray_o = self.gs_params.ray_o[valid_mask]
+                self.gs_params.ray_d = self.gs_params.ray_d[valid_mask]
+                self.gs_params.ray_dist = torch.nn.Parameter(self.gs_params.ray_dist[valid_mask])
+                
             self.setup_optimizer()
 
 def start_mapping_process(cfg, initial_gs):
