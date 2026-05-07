@@ -10,6 +10,7 @@ from tqdm import tqdm
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import random
+import threading
 
 from gs_dyn_obj.grouped_gs import GaussianSuperPrimitive, RGB2SH
 from gs_dyn_obj.gs_param import GSParam
@@ -30,20 +31,20 @@ class MappingConfig:
     device: str = "cuda"
     lr_means: float = 5e-4
     lr_quats: float = 1e-3
-    lr_scales: float = 5e-3
+    lr_scales: float = 1e-2
     lr_colors: float = 2.5e-3
-    lr_opacity: float = 5e-2
+    lr_opacity: float = 0.05
     
-    num_steps_per_frame: int = 50
+    num_steps_per_frame: int = 300
     pyr_levels: int = 2
     pyr_interval: int = 30
     
     kf_every: int = 5
     window_size: int = 20 # Increased window for better global consistency
-    sample_num: int = 8000
+    sample_num: int = 15000
     
     # Loss Weights
-    lambda_dssim: float = 0.5
+    lambda_dssim: float = 0.8
     lambda_sv: float = 0.015
     multi_view_photo_weight: float = 1.0
     multi_view_ncc_weight: float = 1.0
@@ -64,8 +65,10 @@ class MappingConfig:
     near_plane: float = 0.01
     far_plane: float = 100.0
     
+    gs_type: str = "2d" # "2d" or "3d"
     use_pgsr: bool = True
-    fix_color_and_scales: bool = False
+    fix_color: bool = False
+    fix_scale: bool = False
     
     # Virtual Camera
     use_virtul_cam: bool = True
@@ -150,7 +153,7 @@ def sample_patches(img, p):
     return val.reshape(-1, p.shape[1])
 
 def compute_geo_consistency(cam1, cam2, depth1, depth2, pixel_noise_th=1.0):
-    H, W = depth1.shape[-2:]
+    H, W = cam1.height, cam1.width
     device = depth1.device
     grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
     pixels = torch.stack([grid_x, grid_y], dim=-1).float()
@@ -216,13 +219,36 @@ def build_rotation_from_normal(normal):
     R[flip_mask, :, 1] *= -1
     return matrix_to_quaternion(R)
 
+def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None, ray_d=None, ray_dist=None, gs_type="2d"):
+    num_pts = points.shape[0]
+    means = torch.from_numpy(points).float().to(device).requires_grad_(True)
+    colors_sh = RGB2SH(torch.from_numpy(colors).float().to(device)).requires_grad_(True)
+    if normals is not None:
+        quats = build_rotation_from_normal(torch.from_numpy(normals).float().to(device)).requires_grad_(True)
+    else:
+        quats = torch.zeros((num_pts, 4), device=device); quats[:, 0] = 1.0
+        quats = quats.requires_grad_(True)
+    
+    if gs_type == "3d" or gs_type == "normal":
+        scales = (torch.ones((num_pts, 3), device=device) * 0.01).log().requires_grad_(True)
+    else:
+        scales = (torch.ones((num_pts, 2), device=device) * 0.01).log().requires_grad_(True)
+    opacity = torch.logit(torch.ones((num_pts, 1), device=device) * 0.7).requires_grad_(True)
+    
+    if ray_o is not None: ray_o = ray_o.to(device)
+    if ray_d is not None: ray_d = ray_d.to(device)
+    if ray_dist is not None: ray_dist = ray_dist.to(device)
+        
+    return GSParam(means, quats, scales, colors_sh, opacity, ray_o, ray_d, ray_dist)
+
 class GSMapping:
     def __init__(self, cfg: MappingConfig, initial_gs: GSParam):
         self.cfg = cfg
         self.gs_params = initial_gs
-        self.data_queue = mp.Queue(maxsize=5)
+        self.data_queue = mp.Queue(maxsize=1)
         self.stop_event = mp.Event()
         self.last_finished_frame = -1
+        self.lock = threading.Lock()
 
     def setup_optimizer(self):
         params = [
@@ -234,8 +260,9 @@ class GSMapping:
         else:
             params.append({"params": [self.gs_params.means], "lr": self.cfg.lr_means})
             
-        if not self.cfg.fix_color_and_scales:
+        if not self.cfg.fix_scale:
             params.append({"params": [self.gs_params.scales], "lr": self.cfg.lr_scales})
+        if not self.cfg.fix_color:
             params.append({"params": [self.gs_params.colors], "lr": self.cfg.lr_colors})
         
         self.optimizer = torch.optim.Adam(params)
@@ -256,213 +283,127 @@ class GSMapping:
         self.stop_event.set()
 
     def run(self):
-        print("GS Mapping process started.")
-        self.device = torch.device(self.cfg.device)
-        self.gs_params.to(self.device)
-        
-        # Ensure parameters are optimizable
-        if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
-            self.gs_params.ray_dist.requires_grad = True
-            self.gs_params.means.requires_grad = False
-        else:
-            self.gs_params.means.requires_grad = True
-            if self.gs_params.ray_dist is not None:
-                self.gs_params.ray_dist.requires_grad = False
+        try:
+            print("GS Mapping process started.")
+            self.device = torch.device(self.cfg.device)
+            self.gs_params.to(self.device)
             
-        self.gs_params.quats.requires_grad = True
-        self.gs_params.opacity.requires_grad = True
-        
-        if self.cfg.fix_color_and_scales:
-            self.gs_params.scales.requires_grad = False
-            self.gs_params.colors.requires_grad = False
-        else:
-            self.gs_params.scales.requires_grad = True
-            self.gs_params.colors.requires_grad = True
-        
-        self.setup_optimizer()
-        self.keyframes = []
-        
-        radius = 3
-        self.disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=self.device)
-        ky, kx = torch.meshgrid(torch.arange(-radius, radius + 1), torch.arange(-radius, radius + 1), indexing="ij")
-        self.disc_kernel[0, 0, torch.sqrt(kx**2 + ky**2) <= radius + 0.5] = 1
-        self.disc_kernel = self.disc_kernel / self.disc_kernel.sum()
+            # Ensure parameters are optimizable
+            if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                self.gs_params.ray_dist.requires_grad = True
+                self.gs_params.means.requires_grad = False
+            else:
+                self.gs_params.means.requires_grad = True
+                if self.gs_params.ray_dist is not None:
+                    self.gs_params.ray_dist.requires_grad = False
+                
+            self.gs_params.quats.requires_grad = True
+            self.gs_params.opacity.requires_grad = True
+            
+            if self.cfg.fix_scale:
+                self.gs_params.scales.requires_grad = False
+            else:
+                self.gs_params.scales.requires_grad = True
+                
+            if self.cfg.fix_color:
+                self.gs_params.colors.requires_grad = False
+            else:
+                self.gs_params.colors.requires_grad = True
+            
+            self.setup_optimizer()
+            self.keyframes = []
+            
+            radius = 3
+            self.disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=self.device)
+            ky, kx = torch.meshgrid(torch.arange(-radius, radius + 1), torch.arange(-radius, radius + 1), indexing="ij")
+            self.disc_kernel[0, 0, torch.sqrt(kx**2 + ky**2) <= radius + 0.5] = 1
+            self.disc_kernel = self.disc_kernel / self.disc_kernel.sum()
+            self.device = torch.device(self.cfg.device)
+            self.gs_params.to(self.device)
 
-        frame_count = 0
-        while not self.stop_event.is_set():
-            try:
-                frame_data = self.data_queue.get(timeout=1.0)
-            except:
-                continue
-            
-            image, mask, depth = frame_data["image"], frame_data["mask"], frame_data["depth"]
-            K, T_CO = frame_data["K"], frame_data["T_CiO"]
-            
-            H, W = image.shape[:2]
-            image_t = torch.from_numpy(image).float().to(self.device).permute(2, 0, 1) / 255.0
-            mask_t = torch.from_numpy(mask > 0).bool().to(self.device)
-            T_CO_t = torch.from_numpy(T_CO).float().to(self.device)
-            K_t = torch.from_numpy(K).float().to(self.device)
-            
-            cam = MiniCam(K, T_CO, W, H)
-            image_gray_t = image_t.mean(0, keepdim=True)
-            
-            # Coarse-to-Fine Pyramid
-            image_pyr = [image_t]
-            mask_pyr = [mask_t.unsqueeze(0).float()]
-            for _ in range(self.cfg.pyr_levels - 1):
-                image_pyr.append(F.avg_pool2d(image_pyr[-1], 2))
-                mask_pyr.append(F.avg_pool2d(mask_pyr[-1], 2))
-            for i in range(len(mask_pyr)):
-                mask_pyr[i] = (mask_pyr[i][0] > 0.5)
-                
-            # Optimization loop
-            for step in range(self.cfg.num_steps_per_frame):
-                curr_pyr_lvl = max(0, (self.cfg.pyr_levels - 1) - (step // self.cfg.pyr_interval))
-                target_image, target_mask = image_pyr[curr_pyr_lvl], mask_pyr[curr_pyr_lvl]
-                scale = 1.0 / (2**curr_pyr_lvl)
-                curr_K = cam.get_k(scale)
-                
-                self.optimizer.zero_grad()
-                
-                if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
-                    # Update means from rays
-                    self.gs_params.means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
-                
-                render_image, render_depth, render_normal, render_alpha = render_2dgs(
-                    self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales),
-                    self.gs_params.colors, torch.sigmoid(self.gs_params.opacity),
-                    viewmat=T_CO_t, K=curr_K, width=target_image.shape[2], height=target_image.shape[1],
-                    near_plane=self.cfg.near_plane, far_plane=self.cfg.far_plane
-                )
-                
-                # Losses
-                loss_l1 = F.l1_loss(render_image * target_mask, target_image * target_mask)
-                loss_ssim = 1.0 - ssim((render_image * target_mask).unsqueeze(0), (target_image * target_mask).unsqueeze(0))
-                loss_photo = (1.0 - self.cfg.lambda_dssim) * loss_l1 + self.cfg.lambda_dssim * loss_ssim
-                
-                # render_normal is already in camera space from render_2dgs
-                
-                render_alpha_sq = render_alpha.squeeze(0)
-                if self.cfg.use_mask_loss:
-                    loss_mask = F.l1_loss(render_alpha_sq, target_mask.float()) * self.cfg.mask_loss_weight
-                else:
-                    loss_mask = F.l1_loss(render_alpha_sq * (~target_mask).float(), torch.zeros_like(render_alpha_sq))
-
-                # PGSR Losses (Single-view and Multi-view Consistency)
-                loss_sv = torch.tensor(0.0, device=self.device)
-                loss_mv = torch.tensor(0.0, device=self.device)
-                
-                if self.cfg.use_pgsr:
-                    # Single-view Consistency (Normal-Depth)
-                    loss_sv = compute_single_view_loss(
-                        render_normal, render_depth, target_image, cam, 
-                        weight=1.0, 
-                        scale=scale, mask=target_mask
-                    )
+            frame_count = 0
+            while not self.stop_event.is_set():
+                try:
+                    # In real-time mode, we want to process the latest frame and skip older ones in the queue
+                    frame_data = None
+                    while not self.data_queue.empty():
+                        frame_data = self.data_queue.get_nowait()
                     
-                    if step >= 30:
-                        # Select keyframes or use virtual camera
-                        potential_neighbors = [kf for kf in self.keyframes if np.linalg.norm(kf[0].world_view_transform[3, :3].cpu().numpy() - cam.world_view_transform[3, :3].cpu().numpy()) > self.cfg.multi_view_min_dis]
-                        
-                        selected_neighbors = []
-                        if potential_neighbors:
-                            selected_neighbors = random.sample(potential_neighbors, min(2, len(potential_neighbors)))
-                        
-                        # Virtual camera logic
-                        if (self.cfg.use_virtul_cam and random.random() < self.cfg.virtul_cam_prob) or not selected_neighbors:
-                            v_cam = gen_virtul_cam(cam, trans_noise=self.cfg.multi_view_max_dis)
-                            # For virtual cam, we use the current frame's data as "neighbor"
-                            # This helps regularize the geometry from novel viewpoints near the current one
-                            selected_neighbors.append((v_cam, image_t, image_gray_t[0], render_depth[0].detach(), mask_t))
-
-                        if selected_neighbors:
-                            # Sample pixels for LNCC
-                            yy, xx = torch.where(target_mask)
-                            if len(yy) > 0:
-                                perm = torch.randperm(len(yy), device=self.device)[:4096]
-                                px, py = xx[perm], yy[perm]
-                                sampled_pixels = torch.stack([px, py], dim=-1).float()
-                                sampled_indices = py * target_image.shape[2] + px
-                                
-                                for kf in selected_neighbors:
-                                    kf_cam, kf_image_t, kf_image_gray_t, kf_depth_t, kf_mask_t = kf
-                                    
-                                    # Render neighbor view
-                                    r_img_nea, r_depth_nea, _, r_alpha_nea = render_2dgs(
-                                        self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales),
-                                        self.gs_params.colors, torch.sigmoid(self.gs_params.opacity),
-                                        viewmat=kf_cam.world_view_transform.t(), K=kf_cam.K, width=kf_cam.width, height=kf_cam.height
-                                    )
-                                    
-                                    # 1. Photometric Loss (L1 + SSIM)
-                                    loss_mv_photo = (1.0 - self.cfg.lambda_dssim) * F.l1_loss(r_img_nea[:, kf_mask_t], kf_image_t[:, kf_mask_t]) + \
-                                                    self.cfg.lambda_dssim * (1.0 - ssim((r_img_nea * kf_mask_t).unsqueeze(0), (kf_image_t * kf_mask_t).unsqueeze(0)))
-                                    loss_mv += self.cfg.multi_view_photo_weight * loss_mv_photo / len(selected_neighbors)
-                                    
-                                    # 2. LNCC Loss (Homography Warp)
-                                    ncc, _ = compute_multi_view_loss(
-                                        image_gray_t, kf_image_gray_t.unsqueeze(0), render_normal, render_depth,
-                                        cam, kf_cam, pixels=sampled_pixels, valid_indices=sampled_indices
-                                    )
-                                    loss_mv += self.cfg.multi_view_ncc_weight * ncc.mean() / len(selected_neighbors)
-                                    
-                                    # 3. Mask Loss on neighbor
-                                    if self.cfg.use_mask_loss:
-                                        loss_mv += self.cfg.mask_loss_weight * F.l1_loss(r_alpha_nea[0], kf_mask_t.float()) / len(selected_neighbors)
-                                    
-                                    # 4. Geometric Consistency (PGSR)
-                                    if step >= 60:
-                                        d_mask, weights, p_noise = compute_geo_consistency(cam, kf_cam, render_depth, r_depth_nea, self.cfg.multi_view_pixel_noise_th)
-                                        if d_mask.any():
-                                            loss_mv += self.cfg.multi_view_geo_weight * (weights * p_noise)[d_mask].mean() / len(selected_neighbors)
-
-                total_loss = loss_photo + loss_mask + self.cfg.lambda_sv * loss_sv + loss_mv
-                total_loss.backward()
-                self.optimizer.step()
+                    if frame_data is None:
+                        try:
+                            frame_data = self.data_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                except Exception as e:
+                    if not self.stop_event.is_set():
+                        print(f"Error in mapping loop: {e}")
+                    continue
                 
-            # Maintenance
-            if frame_count % self.cfg.kf_every == 0:
-                with torch.no_grad():
-                    _, r_depth, _, _ = render_2dgs(self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales), self.gs_params.colors, torch.sigmoid(self.gs_params.opacity), viewmat=T_CO_t, K=K_t, width=W, height=H)
-                self.keyframes.append((cam, image_t.detach(), image_gray_t[0].detach(), r_depth[0].detach(), mask_t.detach()))
-                if len(self.keyframes) > self.cfg.window_size: self.keyframes.pop(0)
-
-            if frame_count > 0 and frame_count % self.cfg.densify_every == 0:
-                before_count = len(self.gs_params.means)
-                self.densify(image_t, depth, mask_t, cam, T_CO_t)
-                self.prune(T_CO_t, cam)
-                after_count = len(self.gs_params.means)
-                print(f"Mapping Frame {frame_count}: GS count {before_count} -> {after_count}")
-            
-            frame_count += 1
-            self.last_finished_frame = frame_data["frame_idx"]
-            if frame_count % 5 == 0:
-                print(f"Mapping Progress: Processed {frame_count} frames. GS count: {len(self.gs_params.means)}")
+                self.optimize_frame(frame_data)
+                frame_count += 1
+                self.last_finished_frame = frame_data["frame_idx"]
+                if frame_count % 5 == 0:
+                    print(f"Mapping Progress: Processed {frame_count} frames. GS count: {len(self.gs_params.means)}")
+        except KeyboardInterrupt:
+            print("GS Mapping process received KeyboardInterrupt.")
+        except Exception as e:
+            print(f"GS Mapping process encountered an error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print("Cleaning up GS Mapping resources...")
+            self.stop_event.set()
+            self.keyframes = []
+            if hasattr(self, 'optimizer'):
+                del self.optimizer
+            torch.cuda.empty_cache()
+            print("GS Mapping process terminated.")
 
     def densify(self, image_t, depth_np, mask_t, cam, T_CO_t):
         with torch.no_grad():
-            render_image, render_depth, _, _ = render_2dgs(self.gs_params.means, F.normalize(self.gs_params.quats), torch.exp(self.gs_params.scales), self.gs_params.colors, torch.sigmoid(self.gs_params.opacity), viewmat=T_CO_t, K=cam.K, width=cam.width, height=cam.height)
+            render_mode = "3dgs" if self.cfg.gs_type == "3d" else "normal"
+            render_image, render_depth, _, _ = self.gs_params.render(T_CO_t, cam.K, cam.width, cam.height, mode=render_mode)
+            render_depth = render_depth.squeeze()
             depth_curr_t = torch.from_numpy(depth_np).float().to(self.device)
-            overlap_mask = (render_depth[0] > 0) & (depth_curr_t > 0) & mask_t
+            overlap_mask = (render_depth > 0) & (depth_curr_t > 0) & mask_t
             # if overlap_mask.sum() > 100:
-            #     depth_curr_t *= torch.median(render_depth[0][overlap_mask] / depth_curr_t[overlap_mask])
+            #     depth_curr_t *= torch.median(render_depth[overlap_mask] / depth_curr_t[overlap_mask])
             init_proba, penalty = get_lapla_norm(image_t, self.disc_kernel), get_lapla_norm(render_image, self.disc_kernel)
-            sample_mask = (torch.rand_like(init_proba) < (init_proba - penalty) * 2.0) & mask_t & (depth_curr_t > 0)
-            depth_closer = (depth_curr_t < (render_depth[0] - 0.01)) | (render_depth[0] == 0)
+            sample_mask = (torch.rand_like(init_proba) < (init_proba - penalty) * 4.0) & mask_t & (depth_curr_t > 0)
+            depth_closer = (depth_curr_t < (render_depth - 0.01)) | (render_depth == 0)
             sample_mask |= (depth_closer & mask_t & (depth_curr_t > 0) & (torch.rand_like(init_proba) < 0.2))
             
             if sample_mask.sum() > 0:
                 y, x = torch.where(sample_mask)
-                if len(y) > 2000:
-                    perm = torch.randperm(len(y), device=self.device)[:2000]
+                if len(y) > 5000:
+                    perm = torch.randperm(len(y), device=self.device)[:5000]
                     y, x = y[perm], x[perm]
                 z = depth_curr_t[y, x]
+                if len(z) == 0:
+                    print("[DEBUG] No valid points to densify.")
+                    return
+                
                 fx, fy, cx, cy = cam.K[0, 0], cam.K[1, 1], cam.K[0, 2], cam.K[1, 2]
                 pts_c = torch.stack([(x.float() - cx) * z / fx, (y.float() - cy) * z / fy, z], dim=-1)
+                
+                # NaN check for points
+                if torch.isnan(pts_c).any():
+                    valid = ~torch.isnan(pts_c).any(dim=-1)
+                    if not valid.any(): return
+                    y, x, z, pts_c = y[valid], x[valid], z[valid], pts_c[valid]
+
                 full_pts_c = unproject_depth(depth_curr_t, cam.K, cam.height, cam.width)
                 normals_c, _ = d2n_tblr(full_pts_c.permute(2, 0, 1).unsqueeze(0))
-                new_normals_c = -F.normalize(normals_c[0][:, y, x].permute(1, 0), dim=1)
+                
+                # Robust normal extraction
+                extracted_normals = normals_c[0][:, y, x].permute(1, 0)
+                new_normals_c = -F.normalize(extracted_normals, dim=1, eps=1e-6)
+                
+                # NaN check for normals
+                if torch.isnan(new_normals_c).any():
+                    valid = ~torch.isnan(new_normals_c).any(dim=-1)
+                    if not valid.any(): return
+                    y, x, z, pts_c, new_normals_c = y[valid], x[valid], z[valid], pts_c[valid], new_normals_c[valid]
                 T_OC_t = torch.inverse(T_CO_t)
                 new_means = torch.einsum('ij,nj->ni', T_OC_t[:3, :3], pts_c) + T_OC_t[:3, 3]
                 new_normals_o = F.normalize(torch.einsum('ij,nj->ni', T_OC_t[:3, :3], new_normals_c), dim=1)
@@ -470,32 +411,39 @@ class GSMapping:
                 new_quats = build_rotation_from_normal(new_normals_o)
                 sampled_init_proba = init_proba[y, x].clamp_min(1e-6)
                 new_sizes = (1.0 / torch.sqrt(sampled_init_proba)).clamp(2.0, cam.width / 5.0) * (z / ((fx+fy)/2))
-                new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 2).clamp(1e-6, 1e6))
-                new_opacity = torch.log(torch.tensor(0.1 / (1 - 0.1), device=self.device)).repeat(len(new_means), 1)
                 
+                if self.cfg.gs_type == "3d":
+                    new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 3).clamp(1e-6, 1e6))
+                    # Make it slightly "thin" in the third dimension? or just symmetric?
+                    # Let's make it symmetric for now, PGSR will optimize it.
+                else:
+                    new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 2).clamp(1e-6, 1e6))
+                    
+                new_opacity = torch.logit(torch.ones((len(new_means), 1), device=self.device) * 0.1)
+                    
+                new_means = new_means.requires_grad_(True)
+                new_quats = new_quats.requires_grad_(True)
+                new_scales = new_scales.requires_grad_(True)
+                new_colors = new_colors.requires_grad_(True)
+                new_opacity = new_opacity.requires_grad_(True)
+
                 self.gs_params.means = torch.nn.Parameter(torch.cat([self.gs_params.means.data, new_means], dim=0))
                 self.gs_params.quats = torch.nn.Parameter(torch.cat([self.gs_params.quats.data, new_quats], dim=0))
                 self.gs_params.scales = torch.nn.Parameter(torch.cat([self.gs_params.scales.data, new_scales], dim=0))
                 self.gs_params.colors = torch.nn.Parameter(torch.cat([self.gs_params.colors.data, new_colors], dim=0))
                 self.gs_params.opacity = torch.nn.Parameter(torch.cat([self.gs_params.opacity.data, new_opacity], dim=0))
                 
-                if self.cfg.use_ray_dist:
+                if self.gs_params.ray_o is not None:
                     # Initialize rays for new points
                     new_ray_o = T_OC_t[:3, 3].view(1, 3).repeat(len(new_means), 1)
-                    # new_ray_d in camera space
                     new_ray_d_c = F.normalize(pts_c, dim=1)
-                    # new_ray_d in object space
                     new_ray_d_o = F.normalize(torch.einsum('ij,nj->ni', T_OC_t[:3, :3], new_ray_d_c), dim=1)
                     new_ray_dist = torch.norm(pts_c, dim=-1, keepdim=True)
                     
-                    if self.gs_params.ray_o is not None:
-                        self.gs_params.ray_o = torch.cat([self.gs_params.ray_o, new_ray_o], dim=0)
-                        self.gs_params.ray_d = torch.cat([self.gs_params.ray_d, new_ray_d_o], dim=0)
+                    self.gs_params.ray_o = torch.cat([self.gs_params.ray_o, new_ray_o], dim=0)
+                    self.gs_params.ray_d = torch.cat([self.gs_params.ray_d, new_ray_d_o], dim=0)
+                    if self.gs_params.ray_dist is not None:
                         self.gs_params.ray_dist = torch.nn.Parameter(torch.cat([self.gs_params.ray_dist.data, new_ray_dist], dim=0))
-                    else:
-                        self.gs_params.ray_o = new_ray_o
-                        self.gs_params.ray_d = new_ray_d_o
-                        self.gs_params.ray_dist = torch.nn.Parameter(new_ray_dist)
 
                 self.setup_optimizer()
 
@@ -521,9 +469,226 @@ class GSMapping:
                 self.gs_params.ray_d = self.gs_params.ray_d[valid_mask]
                 self.gs_params.ray_dist = torch.nn.Parameter(self.gs_params.ray_dist[valid_mask])
                 
-            self.setup_optimizer()
+    def optimize_frame(self, frame_data, num_steps=None, frame_count=0):
+        image, mask, depth = frame_data["image"], frame_data["mask"], frame_data["depth"]
+        K, T_CO = frame_data["K"], frame_data["T_CiO"]
+        
+        H, W = image.shape[:2]
+        image_t = torch.from_numpy(image).float().to(self.device).permute(2, 0, 1) / 255.0
+        mask_t = torch.from_numpy(mask > 0).bool().to(self.device)
+        T_CO_t = torch.from_numpy(T_CO).float().to(self.device)
+        K_t = torch.from_numpy(K).float().to(self.device)
+        
+        cam = MiniCam(K, T_CO, W, H)
+        image_gray_t = image_t.mean(0, keepdim=True)
+        
+        # Coarse-to-Fine Pyramid
+        image_pyr = [image_t]
+        mask_pyr = [mask_t.unsqueeze(0).float()]
+        for _ in range(self.cfg.pyr_levels - 1):
+            image_pyr.append(F.avg_pool2d(image_pyr[-1], 2))
+            mask_pyr.append(F.avg_pool2d(mask_pyr[-1], 2))
+        for i in range(len(mask_pyr)):
+            mask_pyr[i] = (mask_pyr[i][0] > 0.5)
+            
+        # Optimization loop
+        if num_steps is None: num_steps = self.cfg.num_steps_per_frame
+        for step in range(num_steps):
+            if hasattr(self, 'stop_event') and self.stop_event.is_set(): break
+            
+            curr_pyr_lvl = max(0, (self.cfg.pyr_levels - 1) - (step // self.cfg.pyr_interval))
+            target_image, target_mask = image_pyr[curr_pyr_lvl], mask_pyr[curr_pyr_lvl]
+            scale = 1.0 / (2**curr_pyr_lvl)
+            curr_K = cam.get_k(scale)
+            
+            with self.lock:
+                self.optimizer.zero_grad()
+                
+                if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                    # Update means from rays
+                    self.gs_params.means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
+                
+                render_mode = "3dgs" if self.cfg.gs_type == "3d" else "normal"
+                render_image, render_depth, render_normal, render_alpha = self.gs_params.render(
+                    T_CO_t, curr_K, target_image.shape[2], target_image.shape[1],
+                    mode=render_mode,
+                    near_plane=self.cfg.near_plane, far_plane=self.cfg.far_plane
+                )
+            
+            # Losses
+            loss_l1 = F.l1_loss(render_image * target_mask, target_image * target_mask)
+            loss_ssim = 1.0 - ssim((render_image * target_mask).unsqueeze(0), (target_image * target_mask).unsqueeze(0))
+            loss_photo = (1.0 - self.cfg.lambda_dssim) * loss_l1 + self.cfg.lambda_dssim * loss_ssim
+            
+            render_alpha_sq = render_alpha.squeeze(0)
+            if self.cfg.use_mask_loss:
+                loss_mask = F.l1_loss(render_alpha_sq, target_mask.float()) * self.cfg.mask_loss_weight
+            else:
+                loss_mask = F.l1_loss(render_alpha_sq * (~target_mask).float(), torch.zeros_like(render_alpha_sq))
+            
+            # PGSR Losses (Single-view and Multi-view Consistency)
+            loss_sv = torch.tensor(0.0, device=self.device)
+            loss_mv = torch.tensor(0.0, device=self.device)
+            
+            if self.cfg.use_pgsr:
+                # Single-view Consistency (Normal-Depth)
+                loss_sv = compute_single_view_loss(
+                    render_normal, render_depth, target_image, cam, 
+                    weight=1.0, 
+                    scale=scale, mask=target_mask
+                )
+                
+                if step >= 30:
+                    # Select keyframes or use virtual camera
+                    potential_neighbors = [kf for kf in self.keyframes if np.linalg.norm(kf[0].world_view_transform[3, :3].cpu().numpy() - cam.world_view_transform[3, :3].cpu().numpy()) > self.cfg.multi_view_min_dis]
+                    
+                    selected_neighbors = []
+                    if potential_neighbors:
+                        selected_neighbors = random.sample(potential_neighbors, min(2, len(potential_neighbors)))
+                    
+                    # Virtual camera logic
+                    if (self.cfg.use_virtul_cam and random.random() < self.cfg.virtul_cam_prob) or not selected_neighbors:
+                        v_cam = gen_virtul_cam(cam, trans_noise=self.cfg.multi_view_max_dis)
+                        selected_neighbors.append((v_cam, image_t, image_gray_t[0], render_depth[0].detach(), mask_t))
+                    
+                    if selected_neighbors:
+                        yy, xx = torch.where(target_mask)
+                        if len(yy) > 0:
+                            perm = torch.randperm(len(yy), device=self.device)[:4096]
+                            px, py = xx[perm], yy[perm]
+                            sampled_pixels = torch.stack([px, py], dim=-1).float()
+                            sampled_indices = py * target_image.shape[2] + px
+                            
+                            for kf in selected_neighbors:
+                                kf_cam, kf_image_t, kf_image_gray_t, kf_depth_t, kf_mask_t = kf
+                                render_mode = "3dgs" if self.cfg.gs_type == "3d" else "normal"
+                                r_img_nea, r_depth_nea, _, r_alpha_nea = self.gs_params.render(
+                                    kf_cam.world_view_transform.t(), kf_cam.K, kf_cam.width, kf_cam.height,
+                                    mode=render_mode
+                                )
+                                loss_mv_photo = (1.0 - self.cfg.lambda_dssim) * F.l1_loss(r_img_nea[:, kf_mask_t], kf_image_t[:, kf_mask_t]) + \
+                                                self.cfg.lambda_dssim * (1.0 - ssim((r_img_nea * kf_mask_t).unsqueeze(0), (kf_image_t * kf_mask_t).unsqueeze(0)))
+                                loss_mv += self.cfg.multi_view_photo_weight * loss_mv_photo / len(selected_neighbors)
+                                ncc, _ = compute_multi_view_loss(
+                                    image_gray_t, kf_image_gray_t.unsqueeze(0), render_normal, render_depth,
+                                    cam, kf_cam, pixels=sampled_pixels, valid_indices=sampled_indices
+                                )
+                                loss_mv += self.cfg.multi_view_ncc_weight * ncc.mean() / len(selected_neighbors)
+                                if self.cfg.use_mask_loss:
+                                    loss_mv += self.cfg.mask_loss_weight * F.l1_loss(r_alpha_nea[0], kf_mask_t.float()) / len(selected_neighbors)
+                                if step >= 60:
+                                    d_mask, weights, p_noise = compute_geo_consistency(cam, kf_cam, render_depth, r_depth_nea, self.cfg.multi_view_pixel_noise_th)
+                                    if d_mask.any():
+                                        loss_mv += self.cfg.multi_view_geo_weight * (weights * p_noise)[d_mask].mean() / len(selected_neighbors)
+            
+            total_loss = loss_photo + loss_mask + self.cfg.lambda_sv * loss_sv + loss_mv
+            total_loss.backward()
+            with self.lock:
+                self.optimizer.step()
+        
+        # Maintenance
+        if frame_count % self.cfg.kf_every == 0:
+            with torch.no_grad():
+                render_mode = "3dgs" if self.cfg.gs_type == "3d" else "normal"
+                _, r_depth, _, _ = self.gs_params.render(T_CO_t, K_t, W, H, mode=render_mode)
+            self.keyframes.append((cam, image_t.detach(), image_gray_t[0].detach(), r_depth[0].detach(), mask_t.detach()))
+            if len(self.keyframes) > self.cfg.window_size: self.keyframes.pop(0)
+        
+        if frame_count > 0 and frame_count % self.cfg.densify_every == 0:
+            before_count = len(self.gs_params.means)
+            with self.lock:
+                self.densify(image_t, depth, mask_t, cam, T_CO_t)
+                self.prune(T_CO_t, cam)
+            after_count = len(self.gs_params.means)
+            print(f"Mapping Frame {frame_count}: GS count {before_count} -> {after_count}")
+
+    def refine_pose(self, image_t, mask_t, cam, T_CO_init, steps=60):
+        """Optimizes T_CO and scale to align the GS model with the current image using a pyramid approach."""
+        import torch.optim as optim
+        from utils.loss_utils import ssim
+        device = self.cfg.device
+        
+        def matrix_to_se3(T):
+            from scipy.spatial.transform import Rotation as R
+            r = R.from_matrix(T[:3, :3].cpu().numpy()).as_rotvec()
+            t = T[:3, 3].cpu().numpy()
+            return torch.tensor(np.concatenate([r, t]), device=device, dtype=torch.float32, requires_grad=True)
+
+        def se3_to_matrix(se3):
+            from pytorch3d.transforms import axis_angle_to_matrix
+            rot = axis_angle_to_matrix(se3[:3])
+            trans = se3[3:6]
+            T = torch.eye(4, device=device)
+            T[:3, :3] = rot
+            T[:3, 3] = trans
+            return T
+
+        se3 = matrix_to_se3(T_CO_init)
+        # Add a scale parameter to handle metric drift
+        log_scale = torch.zeros(1, device=device, requires_grad=True)
+        optimizer = optim.Adam([{'params': [se3], 'lr': 1e-3}, {'params': [log_scale], 'lr': 1e-2}])
+        
+        target_image_full = image_t.permute(2, 0, 1) / 255.0
+        mask_full = mask_t.unsqueeze(0)
+        
+        best_loss = float('inf')
+        best_T = T_CO_init.clone()
+
+        # 3-Level Pyramid: 1/4, 1/2, Full
+        pyramid_steps = [steps // 3] * 3
+        for level, level_steps in enumerate(pyramid_steps):
+            down = 2 ** (2 - level)
+            if down > 1:
+                target_image = F.interpolate(target_image_full.unsqueeze(0), scale_factor=1/down, mode='bilinear')[0]
+                mask = F.interpolate(mask_full.float().unsqueeze(0), scale_factor=1/down, mode='nearest')[0, 0] > 0
+                curr_K = cam.K / down; curr_K[2, 2] = 1.0
+                curr_w, curr_h = int(cam.width / down), int(cam.height / down)
+            else:
+                target_image = target_image_full
+                mask = mask_t
+                curr_K = cam.K
+                curr_w, curr_h = cam.width, cam.height
+
+            for _ in range(level_steps):
+                optimizer.zero_grad()
+                T_curr = se3_to_matrix(se3)
+                scale = torch.exp(log_scale)
+                
+                # Apply scale to means for rendering
+                scaled_means = self.gs_params.means * scale
+                
+                render_image, _, _, _ = render_2dgs(
+                    scaled_means, F.normalize(self.gs_params.quats), 
+                    torch.exp(self.gs_params.scales) * scale, self.gs_params.colors, 
+                    torch.sigmoid(self.gs_params.opacity),
+                    viewmat=T_curr, K=curr_K, width=curr_w, height=curr_h
+                )
+                
+                l1 = F.l1_loss(render_image[:, mask], target_image[:, mask])
+                s = 1.0 - ssim(render_image.unsqueeze(0), target_image.unsqueeze(0))
+                loss = 0.8 * l1 + 0.2 * s
+                
+                loss.backward()
+                optimizer.step()
+                
+                if level == 2 and loss.item() < best_loss:
+                    best_loss = loss.item()
+                    best_T = T_curr.detach().clone()
+                    best_scale = scale.item()
+        
+        return best_T, best_scale
+
+    def save_gs(self, path):
+        self.gs_params.dump(Path(path))
+        print(f"GS parameters saved to {path}")
 
 def start_mapping_process(cfg, initial_gs):
+    # Ensure spawn method is used for PyTorch multiprocessing
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+        
     mapper = GSMapping(cfg, initial_gs)
     p = mp.Process(target=mapper.run)
     p.start()

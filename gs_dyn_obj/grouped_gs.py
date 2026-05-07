@@ -182,7 +182,7 @@ class GaussianSuperPrimitive:
             # detach base_quats to avoid reusing the autograd graph across steps
             delta_quat = matrix_to_quaternion(rot_mat).unsqueeze(0)
             new_quats = quaternion_multiply(delta_quat, base_quats)
-            render_image, render_depth, render_normal = render_2dgs(
+            render_image, render_depth, render_normal, render_alpha = render_2dgs(
                 new_means, new_quats, self.gs_params.scales,
                 self.gs_params.colors, self.gs_params.opacity,
                 viewmat=extrin_next,
@@ -331,7 +331,7 @@ class GaussianSuperPrimitive:
 
                 delta_quat = matrix_to_quaternion(rot_mat).unsqueeze(0)
                 new_quats = quaternion_multiply(delta_quat, base_quats)
-                render_image, render_depth, render_normal = render_2dgs(
+                render_image, render_depth, render_normal, render_alpha = render_2dgs(
                     new_means, new_quats, self.gs_params.scales,
                     self.gs_params.colors, self.gs_params.opacity,
                     viewmat=extrin_next,
@@ -553,7 +553,7 @@ class GaussianSuperPrimitive:
 
                     delta_quat = matrix_to_quaternion(rot_mat).unsqueeze(0)
                     new_quats = quaternion_multiply(delta_quat, base_quats)
-                    render_image, render_depth, render_normal = render_2dgs(
+                    render_image, render_depth, render_normal, render_alpha = render_2dgs(
                         new_means, new_quats, self.gs_params.scales,
                         self.gs_params.colors, self.gs_params.opacity,
                         viewmat=extrin_next,
@@ -794,7 +794,7 @@ class GaussianSuperPrimitive3D:
             #     bg=bg
             # )
 
-            render_image, render_depth, render_normal = render_2dgs(
+            render_image, render_depth, render_normal, render_alpha = render_2dgs(
                 new_means, self.gs_params.quats, self.gs_params.scales,
                 self.gs_params.colors, self.gs_params.opacity,
                 viewmat=extrin_next,

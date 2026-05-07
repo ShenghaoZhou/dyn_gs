@@ -8,9 +8,6 @@ def d2n_tblr(points: torch.Tensor,
              d_max: float = 10.0) -> torch.Tensor:
     """ points:     3D points in camera coordinates, shape: (B, 3, H, W)
         k:          neighborhood size
-            e.g.)   If k=3, 3x3 neighborhood is used. Two vectors are defined by doing (top-bottom) and (left-right) 
-                    Then the normals are computed via cross-product
-        d_min/max:  Range of valid depth values 
     """
     k = (k - 1) // 2
 
@@ -49,7 +46,7 @@ def unproject_depth(depth, K, height, width):
     Unproject depth image to 3D points.
     """
     u, v = torch.meshgrid(torch.arange(
-        width), torch.arange(height), indexing='xy')
+        width, device=K.device), torch.arange(height, device=K.device), indexing='xy')
     pixels = torch.stack([u, v, torch.ones_like(u)],
                          dim=-1).float()  # shape (height, width, 3)
     K_inv = torch.linalg.inv(K)

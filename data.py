@@ -72,8 +72,10 @@ class HOT3DDataLoader:
         )
         image = self.load_image(
             self.processed_data_dir / "images" / f"{frame_key}.png")
-        obj_mask = self.load_mask(
-            self.processed_data_dir / "obj_masks" / f"{frame_key}.png")
+        mask_path = self.processed_data_dir / "model_infer" / f"mask_{idx:05d}.png"
+        if not mask_path.exists():
+            mask_path = self.processed_data_dir / "obj_masks" / f"{frame_key}.png"
+        obj_mask = self.load_mask(mask_path)
         hand_mask = self.load_mask(
             self.processed_data_dir / "hand_masks" / f"{frame_key}.png")
         if self.processed_data_dir.joinpath("pred_twohands").exists():
@@ -91,7 +93,13 @@ class HOT3DDataLoader:
             "frame_id": idx
         }
 
-        if self.depth_model is not None:
+        if self.depth_model == "GT":
+            depth_path = self.processed_data_dir / "depth_dyn" / f"{frame_key}.npy"
+            if depth_path.exists():
+                frame["depth"] = np.load(depth_path)
+            else:
+                frame["depth"] = None
+        elif self.depth_model is not None:
             depth_path = self.processed_data_dir / "depth_cache" / self.depth_model / f"{frame_key}.npy"
             if depth_path.exists():
                 frame["depth"] = np.load(depth_path)
