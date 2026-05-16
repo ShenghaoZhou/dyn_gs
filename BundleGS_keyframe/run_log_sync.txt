@@ -1,0 +1,1 @@
+/home/shzhou/project/dyn_gs_exp/.pixi/envs/default/bin/python: can't open file '/home/shzhou/project/dyn_gs_exp/BundleGS/BundleGS/test_hot3d.py': [Errno 2] No such file or directory

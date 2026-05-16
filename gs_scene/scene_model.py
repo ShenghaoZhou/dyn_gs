@@ -5,7 +5,11 @@ import torch.nn.functional as F
 from .keyframe import Keyframe, focal2fov
 from .optimizers import SparseGaussianAdam, fused_ssim
 from .anchor import Anchor
-from .guided_mvs import GuidedMVS
+try:
+    from .guided_mvs import GuidedMVS
+except ImportError:
+    GuidedMVS = None
+
 from .dense_extractor import DenseExtractor
 import math
 from gsplat import rasterization

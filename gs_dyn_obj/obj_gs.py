@@ -70,9 +70,21 @@ class ObjectGS:
 
     def update_reference(self, image: torch.Tensor, T_C_O_ref: torch.Tensor, alpha: torch.Tensor = None):
         """Update the reference image and pose used for warping."""
-        self.image_ref = image
-        self.T_C_O_ref = T_C_O_ref
-        self.alpha_ref = alpha
+        device = self.gs_params.means.device
+        if isinstance(image, np.ndarray):
+            image = torch.from_numpy(image).float().to(device)
+        self.image_ref = image.to(device)
+        
+        if isinstance(T_C_O_ref, np.ndarray):
+            T_C_O_ref = torch.from_numpy(T_C_O_ref).float().to(device)
+        self.T_C_O_ref = T_C_O_ref.to(device)
+        
+        if alpha is not None:
+            if isinstance(alpha, np.ndarray):
+                alpha = torch.from_numpy(alpha).float().to(device)
+            self.alpha_ref = alpha.to(device)
+        else:
+            self.alpha_ref = None
 
     @staticmethod
     def gs_to_planar_params(gs_params, T_CO):
@@ -318,7 +330,7 @@ class ObjectGS:
                                near_plane=0.01, far_plane=10.0, gs_type="2d"):
         """Levenberg-Marquardt pose optimization using analytical Jacobians.
         """
-        print(f"[{self.__class__.__name__}] Entering optimize_wrt_image_lm, mask is {mask is not None}")
+        pass
         device = self.gs_params.means.device
         
         # Prep inputs
@@ -498,9 +510,12 @@ class ObjectGS:
                 dirs = dirs.reshape(3, opt_h, opt_w)
                 
                 n_dot_dir = torch.sum(n_map_o * dirs, dim=0, keepdim=True)
-                # Avoid division by zero
-                depth_curr = -d_map_o / (n_dot_dir + 1e-6)
+                # Avoid division by zero and handle points behind camera
+                depth_curr = -d_map_o / (n_dot_dir + 1e-8)
                 P_curr = dirs * depth_curr # [3, H, W]
+                
+                # Validity mask: point must be in front of camera and alpha must be high
+                valid_mask = (depth_curr > 0.01) & (alpha_o > 0.5)
                 
                 # C. Transform to reference frame
                 R_rc = T_ref_curr[:3, :3]
@@ -566,21 +581,24 @@ class ObjectGS:
                 # col 0 (rx): R @ [0, z, -y]^T = R0*0 + R1*z + R2*-y
                 # col 1 (ry): R @ [-z, 0, x]^T
                 # col 2 (rz): R @ [y, -x, 0]^T
-                RPx0 = R[:, 1:2, None, None] * z[None] - R[:, 2:3, None, None] * y[None] # [3, H, W]
-                RPx1 = -R[:, 0:1, None, None] * z[None] + R[:, 2:3, None, None] * x[None]
-                RPx2 = R[:, 0:1, None, None] * y[None] - R[:, 1:2, None, None] * x[None]
+                RPx0 = R[:, 1, None, None] * z[None] - R[:, 2, None, None] * y[None] # [3, H, W]
+                RPx1 = -R[:, 0, None, None] * z[None] + R[:, 2, None, None] * x[None]
+                RPx2 = R[:, 0, None, None] * y[None] - R[:, 1, None, None] * x[None]
                 
-                J_pose[:, 3] = dp_dP[:, 0] * RPx0[0, 0] + dp_dP[:, 1] * RPx0[1, 0] + dp_dP[:, 2] * RPx0[2, 0]
-                J_pose[:, 4] = dp_dP[:, 0] * RPx1[0, 0] + dp_dP[:, 1] * RPx1[1, 0] + dp_dP[:, 2] * RPx1[2, 0]
-                J_pose[:, 5] = dp_dP[:, 0] * RPx2[0, 0] + dp_dP[:, 1] * RPx2[1, 0] + dp_dP[:, 2] * RPx2[2, 0]
+                J_pose[:, 3] = dp_dP[:, 0] * RPx0[0] + dp_dP[:, 1] * RPx0[1] + dp_dP[:, 2] * RPx0[2]
+                J_pose[:, 4] = dp_dP[:, 0] * RPx1[0] + dp_dP[:, 1] * RPx1[1] + dp_dP[:, 2] * RPx1[2]
+                J_pose[:, 5] = dp_dP[:, 0] * RPx2[0] + dp_dP[:, 1] * RPx2[1] + dp_dP[:, 2] * RPx2[2]
                 
                 # Final Jacobian: J is [3, 6, opt_h, opt_w]
                 # J_c = g_x_c * J_pose_x + g_y_c * J_pose_y
                 J = g_x_sampled.unsqueeze(1) * J_pose[0:1] + g_y_sampled.unsqueeze(1) * J_pose[1:2]
-                # Apply alpha mask
-                J = J * alpha_o # [3, 6, H, W]
+                # Apply alpha and validity mask
+                # valid_mask is [1, opt_h, opt_w], J is [3, 6, opt_h, opt_w]
+                J = J * valid_mask.unsqueeze(1).float() 
                 
                 # Mask Jacobian and residuals
+                res_mask = None
+                J_mask = None
                 if mask_gt_o is not None and g_alpha_x_sampled is not None:
                     J_mask = g_alpha_x_sampled.unsqueeze(1) * J_pose[0:1] + g_alpha_y_sampled.unsqueeze(1) * J_pose[1:2]
                     # Mask residual: alpha_warped - mask_gt
@@ -591,30 +609,46 @@ class ObjectGS:
                     mask_loss_val = torch.mean(torch.abs(res_mask)).item()
                     rr.log("opt/mask_loss", rr.Scalars(mask_loss_val))
                     if step == 0:
-                        if res_scale == 1:
                             print(f"[{self.__class__.__name__}] Initial Mask Loss: {mask_loss_val:.6f}")
                     
-                    # Combine Jacobians and residuals
-                    # Note: Per user request, we do NOT use mask alignment gradients for pose
-                    # We strictly use the provided GT mask to focus on the object area
-                    J_combined = J * mask_gt_o
-                    res_combined = res * mask_gt_o
+                    # Validity mask: only optimize where depth is positive and alpha is high
+                    # Aggregating across channels to get a [1, H, W] mask
+                    valid_mask = (d_map_o > 0.01) & (alpha_o > 0.1) & torch.isfinite(res).all(dim=0, keepdim=True) & torch.isfinite(J).all(dim=1, keepdim=True).all(dim=0, keepdim=True)
+                    
+                # G. Solve LM
+                if mask_gt_o is not None:
+                    # Combine with provided GT mask
+                    # valid_mask is [1, H, W], mask_gt_o is [H, W]
+                    mask_combined = (mask_gt_o > 0.5) & valid_mask.squeeze(0) # [H, W]
+                    J_combined = J * mask_combined[None, None].float()
+                    res_combined = res * mask_combined[None].float()
                 else:
-                    J_combined = J
-                    res_combined = res
+                    J_combined = J * valid_mask.unsqueeze(1).float()
+                    res_combined = res * valid_mask.float()
 
                 # G. Solve LM
-                # Reshape for matrix ops
-                # J_flat is [C, 6, N], res_flat is [C, N]
-                J_flat = J_combined.flatten(2)
-                res_flat = res_combined.flatten(1)
+                # Include Color and Mask residuals in the system
+                # Transpose and flatten Color J [3, 6, H, W] -> [N, 6] and res [3, H, W] -> [N]
+                J_color_flat = J_combined.transpose(1, -1).reshape(-1, 6)
+                res_color_flat = res_combined.transpose(0, -1).reshape(-1)
                 
-                # JTJ: [6, 6]. We sum over channels (c) and pixels (n)
-                # Use einsum for efficiency: sum over channels (c) and pixels (n)
-                JTJ = torch.einsum('cin,cjn->ij', J_flat, J_flat)
+                if mask_gt_o is not None and J_mask is not None:
+                    # Flatten Mask J [1, 6, H, W] -> [M, 6] and res [1, H, W] -> [M]
+                    J_mask_flat = J_mask.transpose(1, -1).reshape(-1, 6)
+                    res_mask_flat = res_mask.transpose(0, -1).reshape(-1)
+                    
+                    # Weight mask loss higher to ensure geometric alignment
+                    J_flat = torch.cat([J_color_flat, 2.0 * J_mask_flat], dim=0)
+                    res_flat = torch.cat([res_color_flat, 2.0 * res_mask_flat], dim=0)
+                else:
+                    J_flat = J_color_flat
+                    res_flat = res_color_flat
                 
-                # JTr: [6]. Sum over channels (c) and pixels (n)
-                JTr = torch.einsum('cin,cn->i', J_flat, res_flat)
+                # JTJ: [6, 6]. 
+                JTJ = J_flat.T @ J_flat
+                
+                # JTr: [6]. 
+                JTr = J_flat.T @ res_flat
                 
                 diag = torch.diag(torch.diag(JTJ))
                 delta = torch.linalg.solve(JTJ + curr_damping * diag + 1e-6 * torch.eye(6, device=device), -JTr)
@@ -624,7 +658,7 @@ class ObjectGS:
                     break
                 
                 dT = torch.eye(4, device=device)
-                dT[:3, :3] = so3_exp_map(delta[3:6].unsqueeze(0))
+                dT[:3, :3] = so3_exp_map(delta[3:6].unsqueeze(0))[0]
                 dT[:3, 3] = delta[0:3]
                 
                 T_C_O_curr = T_C_W_t @ curr_T_W_O
@@ -897,12 +931,12 @@ class ObjectGS:
                 R = R_rc
                 J_pose = torch.zeros(2, 6, opt_h, opt_w, device=device)
                 for i in range(3): J_pose[:, i] = -(dp_dP[:, 0] * R[0, i] + dp_dP[:, 1] * R[1, i] + dp_dP[:, 2] * R[2, i])
-                RPx0 = R[:, 1:2, None, None] * z[None] - R[:, 2:3, None, None] * y[None]
-                RPx1 = -R[:, 0:1, None, None] * z[None] + R[:, 2:3, None, None] * x[None]
-                RPx2 = R[:, 0:1, None, None] * y[None] - R[:, 1:2, None, None] * x[None]
-                J_pose[:, 3] = dp_dP[:, 0] * RPx0[0, 0] + dp_dP[:, 1] * RPx0[1, 0] + dp_dP[:, 2] * RPx0[2, 0]
-                J_pose[:, 4] = dp_dP[:, 0] * RPx1[0, 0] + dp_dP[:, 1] * RPx1[1, 0] + dp_dP[:, 2] * RPx1[2, 0]
-                J_pose[:, 5] = dp_dP[:, 0] * RPx2[0, 0] + dp_dP[:, 1] * RPx2[1, 0] + dp_dP[:, 2] * RPx2[2, 0]
+                RPx0 = R[:, 1, None, None] * z[None] - R[:, 2, None, None] * y[None] # [3, H, W]
+                RPx1 = -R[:, 0, None, None] * z[None] + R[:, 2, None, None] * x[None]
+                RPx2 = R[:, 0, None, None] * y[None] - R[:, 1, None, None] * x[None]
+                J_pose[:, 3] = dp_dP[:, 0] * RPx0[0] + dp_dP[:, 1] * RPx0[1] + dp_dP[:, 2] * RPx0[2]
+                J_pose[:, 4] = dp_dP[:, 0] * RPx1[0] + dp_dP[:, 1] * RPx1[1] + dp_dP[:, 2] * RPx1[2]
+                J_pose[:, 5] = dp_dP[:, 0] * RPx2[0] + dp_dP[:, 1] * RPx2[1] + dp_dP[:, 2] * RPx2[2]
                 
                 # Final Jacobian [3, 6, H, W]
                 J = g_x_sampled.unsqueeze(1) * J_pose[0:1] + g_y_sampled.unsqueeze(1) * J_pose[1:2]
@@ -922,7 +956,7 @@ class ObjectGS:
                     break
                 
                 dT = torch.eye(4, device=device)
-                dT[:3, :3] = so3_exp_map(delta[3:6].unsqueeze(0))
+                dT[:3, :3] = so3_exp_map(delta[3:6].unsqueeze(0))[0]
                 dT[:3, 3] = delta[0:3]
                 
                 T_C_O_curr = T_C_W_t @ curr_T_W_O

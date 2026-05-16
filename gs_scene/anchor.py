@@ -16,9 +16,11 @@ class Anchor:
     def __init__(
         self,
         gaussian_params: Dict[str, Dict[str, torch.Tensor]],
-        position: torch.Tensor = torch.zeros(3, dtype=torch.float32, device="cuda"),
+        position: torch.Tensor = None,
     ):
         self.gaussian_params = gaussian_params
+        if position is None:
+            position = torch.zeros(3, dtype=torch.float32)
         self.position = position
         self.keyframe_ids = []
 

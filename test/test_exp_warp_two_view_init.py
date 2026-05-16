@@ -1,0 +1,359 @@
+import numpy as np
+import cv2
+import rerun as rr
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from tqdm import tqdm
+from gs_dyn_obj.grouped_gs import GaussianSuperPrimitive
+from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
+from pytorch3d.transforms.so3 import so3_exp_map
+from gsplat import rasterization_2dgs
+import matplotlib.pyplot as plt
+import tyro
+from dataclasses import dataclass
+import io
+from PIL import Image
+from gs_dyn_obj.utils.init import d2n_tblr, unproject_depth
+
+@dataclass
+class Config:
+    data_root: str = "data/hot3d_clips_processed/clip-003312"
+    init_frame: int = 35
+    target_frame: int = 35
+    near_plane: float = 0.01
+    far_plane: float = 10.0
+    device: str = "cuda"
+    perturb_t_std: float = 0.01  # 1cm
+    perturb_r_std: float = 0.02  # ~1.1 degrees
+
+def depth_to_rgb(depth, min_val=0.0, max_val=2.0):
+    """Consistent colormapping for depth visualization."""
+    depth_norm = np.clip((depth - min_val) / (max_val - min_val), 0, 1)
+    colormap = plt.get_cmap("magma")
+    rgb = (colormap(depth_norm)[..., :3] * 255).astype(np.uint8)
+    return rgb
+
+def gs_to_planar_params(gs_params, T_CW):
+    """
+    Convert GS parameters to planar surface parameters (normal and distance) in camera view.
+    """
+    means = gs_params.means # [N, 3]
+    quats = gs_params.quats # [N, 4]
+    R_WG = quaternion_to_matrix(quats) # [N, 3, 3]
+    n_W = R_WG[:, :, 2] # [N, 3]
+    R_CW = T_CW[:3, :3]
+    t_CW = T_CW[:3, 3]
+    n_C = torch.einsum('ij,nj->ni', R_CW, n_W) # [N, 3]
+    p_C = torch.einsum('ij,nj->ni', R_CW, means) + t_CW # [N, 3]
+    d = -torch.sum(n_C * p_C, dim=1, keepdim=True) # [N, 1]
+    return n_C, d
+
+def render_custom_attribute(gs_params, attr, T_CW, K, width, height, near_plane=0.01, far_plane=100.0):
+    """
+    Render a custom attribute using gsplat rasterizer.
+    """
+    viewmats = T_CW.unsqueeze(0).unsqueeze(0).contiguous()
+    Ks = K.unsqueeze(0).unsqueeze(0).contiguous()
+    means = gs_params.means.unsqueeze(0).contiguous()
+    quats = gs_params.quats.unsqueeze(0).contiguous()
+    
+    if gs_params.scales.shape[-1] == 2:
+        scales = torch.cat([gs_params.scales, torch.zeros_like(gs_params.scales[..., :1])], dim=-1).unsqueeze(0).contiguous()
+    else:
+        scales = gs_params.scales.unsqueeze(0).contiguous()
+        
+    opacities = gs_params.opacity.squeeze(-1).unsqueeze(0).contiguous()
+    colors = attr.unsqueeze(0).unsqueeze(0).contiguous()
+    
+    render_colors, render_alphas, _, _, _, _, _ = rasterization_2dgs(
+        means, quats, scales, opacities, colors,
+        viewmats, Ks, width, height,
+        near_plane=near_plane, far_plane=far_plane,
+        render_mode="RGB"
+    )
+    return render_colors[0, 0].permute(2, 0, 1), render_alphas[0, 0].permute(2, 0, 1)
+
+def manual_forward_homography_warp(image_ref_t, n_C, d, T_curr_ref, K, mask=None):
+    """
+    Explicitly compute the forward warp of each pixel using the plane-induced homography formula.
+    image_ref_t: [C, H, W] torch tensor
+    n_C: [N, 3] normals in ref camera view
+    d: [N, 1] distances in ref camera view
+    """
+    C, H, W = image_ref_t.shape
+    device = n_C.device
+    
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, device=device), 
+        torch.arange(W, device=device), 
+        indexing='ij'
+    )
+    x0 = grid_x.reshape(-1)
+    y0 = grid_y.reshape(-1)
+    
+    if mask is not None:
+        m = mask.reshape(-1)
+        x0 = x0[m]
+        y0 = y0[m]
+        colors = image_ref_t.reshape(C, -1).t()[m]
+        n_C = n_C[m] if n_C.shape[0] > 1 else n_C
+        d = d[m] if d.shape[0] > 1 else d
+    else:
+        colors = image_ref_t.reshape(C, -1).t()
+
+    u0 = torch.stack([x0, y0, torch.ones_like(x0)], dim=1).float() # [N, 3] (homogeneous)
+    
+    R = T_curr_ref[:3, :3]
+    t = T_curr_ref[:3, 3]
+    
+    K_inv = torch.inverse(K)
+    dir0 = (K_inv @ u0.t()).t() # [N, 3]
+    
+    n_dot_dir = torch.sum(n_C * dir0, dim=1, keepdim=True)
+    d_safe = torch.where(torch.abs(d) > 1e-6, d, torch.ones_like(d))
+    p1_scaled = torch.matmul(R, dir0.t()).t() - (n_dot_dir / d_safe) * t.view(1, 3)
+    
+    u1_homog = torch.matmul(K, p1_scaled.t()).t()
+    u1_pix = u1_homog[:, :2] / (u1_homog[:, 2:3] + 1e-8)
+    z1_scaled = u1_homog[:, 2]
+    
+    valid = (u1_pix[:, 0] >= 0) & (u1_pix[:, 0] < W-1) & \
+            (u1_pix[:, 1] >= 0) & (u1_pix[:, 1] < H-1) & \
+            (z1_scaled > 0)
+    
+    u1_pix = u1_pix[valid]
+    colors = colors[valid]
+    z1_scaled = z1_scaled[valid]
+    
+    sort_idx = torch.argsort(z1_scaled, descending=True)
+    u1_pix = u1_pix[sort_idx]
+    colors = colors[sort_idx]
+    
+    x = u1_pix[:, 0]
+    y = u1_pix[:, 1]
+    
+    x0_idx = torch.floor(x).long()
+    x1_idx = x0_idx + 1
+    y0_idx = torch.floor(y).long()
+    y1_idx = y0_idx + 1
+    
+    wa = (x1_idx.float() - x) * (y1_idx.float() - y)
+    wb = (x - x0_idx.float()) * (y1_idx.float() - y)
+    wc = (x1_idx.float() - x) * (y - y0_idx.float())
+    wd = (x - x0_idx.float()) * (y - y0_idx.float())
+    
+    mask00 = (x0_idx >= 0) & (x0_idx < W) & (y0_idx >= 0) & (y0_idx < H)
+    mask10 = (x1_idx >= 0) & (x1_idx < W) & (y0_idx >= 0) & (y0_idx < H)
+    mask01 = (x0_idx >= 0) & (x0_idx < W) & (y1_idx >= 0) & (y1_idx < H)
+    mask11 = (x1_idx >= 0) & (x1_idx < W) & (y1_idx >= 0) & (y1_idx < H)
+    
+    warped = torch.zeros((H, W, C), device=device)
+    
+    for m, y_idx, x_idx, w in zip([mask00, mask10, mask01, mask11], 
+                                  [y0_idx, y0_idx, y1_idx, y1_idx], 
+                                  [x0_idx, x1_idx, x0_idx, x1_idx], 
+                                  [wa, wb, wc, wd]):
+        if m.any():
+            warped.index_put_((y_idx[m], x_idx[m]), colors[m] * w[m].unsqueeze(-1), accumulate=True)
+
+    return warped.permute(2, 0, 1)
+
+def load_pose(data_root, frame_idx):
+    poses_file = Path(data_root) / "object_poses.txt"
+    with open(poses_file, "r") as f:
+        lines = f.readlines()
+    if frame_idx >= len(lines):
+        return None
+    line = lines[frame_idx].split()
+    # timestamp tx ty tz qx qy qz qw
+    t = np.array([float(line[1]), float(line[2]), float(line[3])])
+    q = np.array([float(line[4]), float(line[5]), float(line[6]), float(line[7])]) # x y z w
+    
+    from scipy.spatial.transform import Rotation as R
+    r = R.from_quat(q).as_matrix()
+    T = np.eye(4)
+    T[:3, :3] = r
+    T[:3, 3] = t
+    return T
+
+def setup_blueprint():
+    import rerun.blueprint as rrb
+    
+    blueprint = rrb.Blueprint(
+        rrb.Tabs(
+            rrb.Vertical(
+                rrb.Horizontal(
+                    rrb.Vertical(
+                        rrb.Spatial2DView(name="GT Image", contents=["gt/image"]),
+                        rrb.Spatial2DView(name="GT Depth", contents=["gt/depth"]),
+                        rrb.Spatial2DView(name="GT Normal", contents=["gt/normal"]),
+                    ),
+                    rrb.Vertical(
+                        rrb.Spatial2DView(name="GS Depth @ 35", contents=["gs_init/depth"]),
+                        rrb.Spatial2DView(name="GS Normal @ 35", contents=["gs_init/normal"]),
+                    ),
+                    rrb.Grid(
+                        *[
+                            rrb.Spatial2DView(name=f"Warped Sample {i}", contents=[f"warped/sample_{i}"])
+                            for i in range(5)
+                        ],
+                        name="Warped Samples"
+                    ),
+                ),
+                name="2D Warping"
+            ),
+            rrb.Vertical(
+                rrb.Horizontal(
+                    rrb.Spatial2DView(name="GT Depth", contents=["gt/depth"]),
+                    rrb.Spatial2DView(name="GS Depth", contents=["gs_init/depth"]),
+                ),
+                rrb.Horizontal(
+                    rrb.Spatial2DView(name="GT Normal", contents=["gt/normal"]),
+                    rrb.Spatial2DView(name="GS Normal", contents=["gs_init/normal"]),
+                ),
+                name="Comparison 2D"
+            ),
+            rrb.Horizontal(
+                rrb.Spatial3DView(name="GT PC", contents=["world/object_gt"]),
+                rrb.Spatial3DView(name="GS PC from Depth", contents=["world/gs_depth_pc"]),
+                rrb.Spatial3DView(name="GS Original", contents=["world/object_gs"]),
+                name="Comparison 3D"
+            ),
+            rrb.Spatial3DView(
+                name="Point Clouds",
+                contents=["world/**"]
+            )
+        )
+    )
+    return blueprint
+
+def main(cfg: Config):
+    rr.init("exp_warp_two_view", spawn=False)
+    rr.connect_grpc("rerun+http://128.175.109.248:9876/proxy")
+    
+    # Send blueprint
+    rr.send_blueprint(setup_blueprint())
+    
+    device = torch.device(cfg.device)
+    data_dir = Path(cfg.data_root)
+    
+    # 1. Load data for init frame (25)
+    init_stem = f"{cfg.init_frame:06d}"
+    image_init = np.array(cv2.imread(str(data_dir / "images" / f"{init_stem}.png"))[..., ::-1])
+    mask_init = np.array(cv2.imread(str(data_dir / "obj_masks" / f"{init_stem}.png"), cv2.IMREAD_GRAYSCALE))
+    depth_init = np.load(data_dir / "depth_cache" / "DA3METRIC-LARGE" / f"{init_stem}.npy")
+    K_init = np.load(data_dir / "intrinsics" / f"{init_stem}.npy")
+    T_C_O_init = load_pose(cfg.data_root, cfg.init_frame)
+    
+    # Initialize GS
+    gsp = GaussianSuperPrimitive(image_init, mask_init, depth_init, T_C_O_init, K_init)
+    gs_params = gsp.gs_params
+    
+    # 2. Load data for target frame (35)
+    target_stem = f"{cfg.target_frame:06d}"
+    image_target_gt = np.array(cv2.imread(str(data_dir / "images" / f"{target_stem}.png"))[..., ::-1])
+    depth_target_gt = np.load(data_dir / "depth_dyn" / f"{target_stem}.npy")
+    K_target = np.load(data_dir / "intrinsics" / f"{target_stem}.npy")
+    T_C_O_target_gt = load_pose(cfg.data_root, cfg.target_frame)
+    
+    K_torch = torch.from_numpy(K_target).float().to(device)
+    T_C_O_target_gt_torch = torch.from_numpy(T_C_O_target_gt).float().to(device)
+    H, W = image_target_gt.shape[:2]
+    
+    # Compute GT normal for visualization
+    depth_target_gt_torch = torch.from_numpy(depth_target_gt).float().to(device)
+    xyz_target_gt = unproject_depth(depth_target_gt_torch, K_torch, H, W)
+    normal_target_gt, _ = d2n_tblr(xyz_target_gt.permute(2, 0, 1).unsqueeze(0))
+    normal_target_gt = -normal_target_gt[0].permute(1, 2, 0) # point to camera
+    normal_vis_gt = (normal_target_gt.cpu().numpy() + 1.0) / 2.0
+    
+    # 3. GS Render at target frame
+    with torch.no_grad():
+        n_gs, d_gs = gs_to_planar_params(gs_params, T_C_O_target_gt_torch)
+        n_map_gs, alpha_gs = render_custom_attribute(gs_params, n_gs, T_C_O_target_gt_torch, K_torch, W, H, cfg.near_plane, cfg.far_plane)
+        d_3ch_gs, _ = render_custom_attribute(gs_params, d_gs.repeat(1, 3), T_C_O_target_gt_torch, K_torch, W, H, cfg.near_plane, cfg.far_plane)
+        d_map_gs = d_3ch_gs[0]
+        color_map_gs, _ = render_custom_attribute(gs_params, gs_params.colors, T_C_O_target_gt_torch, K_torch, W, H, cfg.near_plane, cfg.far_plane)
+        
+    normal_vis_gs = (n_map_gs.permute(1, 2, 0).cpu().numpy() + 1.0) / 2.0
+    depth_vis_gs = depth_to_rgb(d_map_gs.cpu().numpy())
+    depth_vis_gt = depth_to_rgb(depth_target_gt)
+    image_gs_rendered = (color_map_gs.permute(1, 2, 0).cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+    
+    # Log GT and initial GS
+    rr.log("gt/image", rr.Image(image_target_gt))
+    rr.log("gt/depth", rr.Image(depth_vis_gt))
+    rr.log("gt/normal", rr.Image((normal_vis_gt.clip(0, 1) * 255).astype(np.uint8)))
+    
+    rr.log("gs_init/depth", rr.Image(depth_vis_gs))
+    rr.log("gs_init/normal", rr.Image((normal_vis_gs.clip(0, 1) * 255).astype(np.uint8)))
+    
+    # --- 3D Point Clouds ---
+    # GT Point Cloud in Object Frame
+    T_O_C_target_gt = np.linalg.inv(T_C_O_target_gt)
+    pts_C_gt = xyz_target_gt.reshape(-1, 3)
+    colors_gt = image_target_gt.reshape(-1, 3)
+    valid_gt = (depth_target_gt.reshape(-1) > 0.01)
+    pts_C_gt = pts_C_gt[valid_gt]
+    colors_gt = colors_gt[valid_gt]
+    pts_O_gt = (T_O_C_target_gt[:3, :3] @ pts_C_gt.cpu().numpy().T).T + T_O_C_target_gt[:3, 3]
+    rr.log("world/object_gt", rr.Points3D(pts_O_gt, colors=colors_gt, radii=0.001))
+    
+    # GS Point Cloud from rendered depth
+    pts_C_gs_depth = unproject_depth(d_map_gs, K_torch, H, W).reshape(-1, 3)
+    colors_gs_pc = image_gs_rendered.reshape(-1, 3)
+    valid_gs_depth = (d_map_gs.reshape(-1).cpu().numpy() > 0.01) & (alpha_gs.reshape(-1).cpu().numpy() > 0.5)
+    pts_C_gs_depth = pts_C_gs_depth[valid_gs_depth]
+    colors_gs_pc = colors_gs_pc[valid_gs_depth]
+    pts_O_gs_pc = (T_O_C_target_gt[:3, :3] @ pts_C_gs_depth.cpu().numpy().T).T + T_O_C_target_gt[:3, 3]
+    rr.log("world/gs_depth_pc", rr.Points3D(pts_O_gs_pc, colors=colors_gs_pc, radii=0.001))
+    
+    # GS Original Point Cloud (already in Object Frame)
+    gs_pts_O = gs_params.means.cpu().numpy()
+    gs_colors = (gs_params.colors.cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+    rr.log("world/object_gs", rr.Points3D(gs_pts_O, colors=gs_colors, radii=0.001))
+    
+    # Add coordinate frames
+    rr.log("world/object_gt/frame", rr.Transform3D(relation=rr.TransformRelation.ParentFromChild))
+    rr.log("world/gs_depth_pc/frame", rr.Transform3D(relation=rr.TransformRelation.ParentFromChild))
+    rr.log("world/object_gs/frame", rr.Transform3D(relation=rr.TransformRelation.ParentFromChild))
+
+    # 4. Warp with 5 perturbed poses
+    image_ref_t = torch.from_numpy(image_init).float().to(device).permute(2, 0, 1) / 255.0
+    with torch.no_grad():
+        T_C_O_init_torch = torch.from_numpy(T_C_O_init).float().to(device)
+        n_ref, d_ref = gs_to_planar_params(gs_params, T_C_O_init_torch)
+        n_ref_map, alpha_ref_map = render_custom_attribute(gs_params, n_ref, T_C_O_init_torch, torch.from_numpy(K_init).float().to(device), image_init.shape[1], image_init.shape[0])
+        d_ref_3ch_map, _ = render_custom_attribute(gs_params, d_ref.repeat(1, 3), T_C_O_init_torch, torch.from_numpy(K_init).float().to(device), image_init.shape[1], image_init.shape[0])
+        d_ref_map = d_ref_3ch_map[0]
+        
+    mask_ref = alpha_ref_map > 0.5
+    n_ref_flat = n_ref_map.permute(1, 2, 0).reshape(-1, 3)
+    d_ref_flat = d_ref_map.reshape(-1, 1)
+
+    for i in range(5):
+        # Perturb T_C_O_target_gt
+        delta_t = torch.randn(3, device=device) * cfg.perturb_t_std
+        delta_r_log = torch.randn(3, device=device) * cfg.perturb_r_std
+        
+        delta_R = so3_exp_map(delta_r_log.unsqueeze(0))[0]
+        T_delta = torch.eye(4, device=device)
+        T_delta[:3, :3] = delta_R
+        T_delta[:3, 3] = delta_t
+        
+        T_C_O_perturbed = T_delta @ T_C_O_target_gt_torch
+        
+        T_perturbed_ref = T_C_O_perturbed @ torch.inverse(T_C_O_init_torch)
+        
+        with torch.no_grad():
+            warped = manual_forward_homography_warp(image_ref_t, n_ref_flat, d_ref_flat, T_perturbed_ref, K_torch, mask=mask_ref)
+        
+        warped_np = (warped.permute(1, 2, 0).cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+        rr.log(f"warped/sample_{i}", rr.Image(warped_np))
+
+    print("Finished.")
+
+if __name__ == "__main__":
+    cfg = tyro.cli(Config)
+    main(cfg)
