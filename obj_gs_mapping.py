@@ -219,7 +219,7 @@ def build_rotation_from_normal(normal):
     R[flip_mask, :, 1] *= -1
     return matrix_to_quaternion(R)
 
-def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None, ray_d=None, ray_dist=None, gs_type="2d"):
+def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None, ray_d=None, ray_dist=None, gs_type="2d", fx=None, fy=None):
     num_pts = points.shape[0]
     means = torch.from_numpy(points).float().to(device).requires_grad_(True)
     colors_sh = RGB2SH(torch.from_numpy(colors).float().to(device)).requires_grad_(True)
@@ -229,10 +229,27 @@ def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None
         quats = torch.zeros((num_pts, 4), device=device); quats[:, 0] = 1.0
         quats = quats.requires_grad_(True)
     
-    if gs_type == "3d" or gs_type == "normal":
-        scales = (torch.ones((num_pts, 3), device=device) * 0.01).log().requires_grad_(True)
+    # Determine scale dynamically using perspective projection (matching SceneModel logic)
+    if fx is None or fy is None:
+        f_avg = 500.0
     else:
-        scales = (torch.ones((num_pts, 2), device=device) * 0.01).log().requires_grad_(True)
+        f_avg = 0.5 * (fx + fy)
+        
+    pixel_size = 1.5
+    angular_factor = pixel_size / f_avg
+    
+    if ray_dist is not None:
+        ray_dist_t = torch.from_numpy(ray_dist).float().to(device) if isinstance(ray_dist, np.ndarray) else ray_dist.float().to(device)
+        physical_scale = angular_factor * ray_dist_t.squeeze(-1)
+    else:
+        physical_scale = torch.ones(num_pts, device=device) * (angular_factor * 0.5)
+        
+    physical_scale = physical_scale.clamp(1e-6, 1e6)
+    
+    if gs_type == "3d" or gs_type == "normal":
+        scales = torch.log(physical_scale.unsqueeze(-1).repeat(1, 3)).requires_grad_(True)
+    else:
+        scales = torch.log(physical_scale.unsqueeze(-1).repeat(1, 2)).requires_grad_(True)
     opacity = torch.logit(torch.ones((num_pts, 1), device=device) * 0.7).requires_grad_(True)
     
     if ray_o is not None: ray_o = ray_o.to(device)

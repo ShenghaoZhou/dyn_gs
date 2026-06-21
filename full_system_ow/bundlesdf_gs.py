@@ -25,8 +25,8 @@ from gs_dyn_obj.gs_param import GSParam
 from gs_dyn_obj.gs_rendering import render_2dgs, render_3dgs
 from obj_gs_mapping import GSMapping, MappingConfig, MiniCam, gen_virtul_cam, compute_single_view_loss
 # Add PGSR to sys.path for ssim
-sys.path.append(str(Path(__file__).parent.parent / "third_party" / "PGSR"))
-from utils.loss_utils import ssim
+# sys.path.append(str(Path(__file__).parent.parent / "third_party" / "PGSR"))
+# from utils.loss_utils import ssim
 
 @dataclass
 class GeoTrackerConfig:

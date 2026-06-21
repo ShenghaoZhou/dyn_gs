@@ -1,0 +1,683 @@
+import sys
+import os
+from pathlib import Path
+from typing import Literal
+import json
+import logging
+
+# Add current folder to sys.path for self-contained imports
+project_root = Path(__file__).parent.absolute()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# Imports from project
+from dataclasses import dataclass, field
+import tyro
+import torch
+import numpy as np
+import cv2
+import rerun as rr
+import time
+import queue
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+from collections import defaultdict
+import math
+from tqdm import tqdm
+import random
+
+def set_seed(seed: int):
+    """Sets the seed for reproducibility."""
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# Imports for Dynamic System (BundleGS)
+from bundlesdf_gs import BundleSdfGS, GeoTrackerConfig
+from obj_gs_mapping import MappingConfig, GSMapping, init_gs_from_tracker_points, unproject_depth, d2n_tblr, start_mapping_process, MiniCam
+from gs_dyn_obj.obj_gs import ObjectGS
+from gs_dyn_obj.gs_param import GSParam
+from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply
+from gs_scene.optimizers import fused_ssim
+import rerun.blueprint as rrb
+from scipy.spatial.transform import Rotation as R, Slerp
+from lpipsPyTorch import lpips
+
+# Background Scene Model
+from gs_scene.scene_model import SceneModel
+try:
+    from old_ref.keyframe_window import KeyFrameWindow
+except ImportError:
+    class KeyFrameWindowFallback:
+        def __init__(self, chunk_size, rr_log=True):
+            self.chunk_size = chunk_size
+            self.count = 0
+        def try_add_frame(self, frame, model):
+            if self.count % self.chunk_size == 0:
+                self.count += 1
+                return True
+            self.count += 1
+            return False
+    KeyFrameWindow = KeyFrameWindowFallback
+
+@dataclass
+class GlobalConfig:
+    data_root: str = "data/hot3d_clips_processed"
+    clip_id: str = "clip-003312"
+    device: str = "cuda"
+    num_frames: int = 150
+    init_frame: int = 0
+    n_features: int = 2000
+    feature_type: Literal["orb", "gftt", "grid"] = "grid"
+    ransac_thresh: float = 1.0
+    informed_thresh: float = 50.0
+    max_pose_jump: float = 1.0
+    num_opt_steps: int = 50
+    mask_loss_weight: float = 20.0
+    pyr_levels: int = 2
+    window_size: int = 10
+    grid_spacing: int = 2
+    gs_type: Literal["2d", "3d"] = "2d"
+    rerun_url: str = "rerun+http://127.0.0.1/proxy"
+    serve: bool = False
+    no_vis: bool = False
+    debug: bool = False
+    separate_render: bool = True
+    use_alpha_blending: bool = True
+    save_render: bool = False
+    render_dir: str = "renders"
+    use_hand_mask: bool = True
+    
+    # Static BG specific
+    chunk_size: int = 8
+    kf_every: int = 5
+    lr_anchor: float = 1e-3
+    lr_gs: float = 1e-3
+    use_guided_mvs: bool = False
+    use_anchors: bool = False
+    use_exposure: bool = False
+    pyr_levels_static: int = 2
+    num_steps_static: int = 10 
+    anchor_dist_threshold: float = 2.0
+    init_proba_scaler: float = 5.0
+    
+    # Dynamic specific
+    use_photometric: bool = True
+    photometric_mode: str = "lm"
+    n_init_frames: int = 10
+    num_steps_dyn: int = 150
+    densify_every: int = 5
+    prune_every: int = 1
+    min_kf_rot: float = 5.0
+    kf_overlap_thresh: float = 0.8
+    min_kf_interval: int = 3
+    max_photo_jump_t: float = 0.5
+    max_photo_jump_R: float = 20.0
+    fix_color: bool = False
+    fix_scale: bool = False
+    use_ray_dist: bool = False
+    multi_view_ncc_weight: float = 0.0
+    kf_every_dyn: int = 5
+    do_refine: bool = True
+    disable_bg: bool = False # Enable BG by default
+    densify_error_threshold: float = 0.8
+    
+    # Tracker specific
+    use_informed_filtering: bool = True
+    use_occlusion_check: bool = True
+    align_depth: bool = True
+    align_with_bias: bool = True
+    multiprocess_dyn: bool = False # Default to False as in test_hot3d.py
+    use_pgsr: bool = False
+    seed: int = 42
+
+def load_frame_data_v2(data_dir, frame_idx):
+    import cv2
+    import numpy as np
+    from scipy.spatial.transform import Rotation as R
+    """Helper to load frame data consistent with run_full_system_debug.py"""
+    img_path = data_dir / "images" / f"{frame_idx:06d}.png"
+    if not img_path.exists():
+        img_path = data_dir / "images" / f"{frame_idx:06d}.jpg"
+    
+    # Search for mask
+    mask_path = data_dir / "model_infer" / f"mask_{frame_idx:05d}.png"
+    if not mask_path.exists():
+        mask_path = data_dir / "dyn_obj_masked_infer" / f"mask_{frame_idx:05d}.png"
+    if not mask_path.exists():
+        mask_path = data_dir / "obj_masks" / f"{frame_idx:06d}.png"
+    
+    # Search for depth
+    depth_path = data_dir / "model_infer" / f"depth_{frame_idx:05d}.npy"
+    if not depth_path.exists():
+        depth_path = data_dir / "dyn_obj_masked_infer" / f"depth_{frame_idx:05d}.npy"
+    if not depth_path.exists():
+        depth_path = data_dir / "depth" / f"{frame_idx:06d}.npy"
+    if not depth_path.exists():
+        depth_path = data_dir / "depth_dyn" / f"{frame_idx:06d}.npy"
+    
+    k_path = data_dir / "intrinsics" / f"{frame_idx:06d}.npy"
+    extrin_path = data_dir / "extrinsics" / f"{frame_idx:06d}.npy"
+    hand_mask_path = data_dir / "hand_masks" / f"{frame_idx:06d}.png"
+    
+    if not img_path.exists(): return None
+    
+    image = cv2.imread(str(img_path))
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    h, w = image.shape[:2]
+    
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) if mask_path.exists() else None
+    if mask is not None and mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        
+    depth = np.load(depth_path).astype(np.float32) if depth_path.exists() else None
+    if depth is not None and depth.shape[:2] != (h, w):
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        
+    K = np.load(k_path)
+    extrin = np.load(extrin_path)
+    hand_mask = cv2.imread(str(hand_mask_path), cv2.IMREAD_GRAYSCALE) if hand_mask_path.exists() else None
+    if hand_mask is not None and hand_mask.shape[:2] != (h, w):
+        hand_mask = cv2.resize(hand_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        
+    T_WO_gt = None
+    obj_pose_path = data_dir / "object_poses.txt"
+    if obj_pose_path.exists():
+        with open(obj_pose_path, "r") as f:
+            lines = f.readlines()
+            if frame_idx < len(lines):
+                parts = [float(x) for x in lines[frame_idx].split()]
+                if len(parts) >= 8:
+                    t = np.array(parts[1:4])
+                    q = np.array(parts[4:8])
+                    T_WO_gt = np.eye(4)
+                    T_WO_gt[:3, :3] = R.from_quat(q).as_matrix()
+                    T_WO_gt[:3, 3] = t
+                
+    return {
+        "image": image, "mask": mask, "depth": depth, "K": K, "extrin": extrin,
+        "hand_mask": hand_mask, "T_WO_gt": T_WO_gt, "frame_idx": frame_idx
+    }
+
+def data_loader_worker(cfg, static_q, dynamic_q):
+    set_seed(cfg.seed)
+    data_dir = Path(cfg.data_root) / cfg.clip_id
+    count = 0
+    for i in range(cfg.num_frames):
+        idx = cfg.init_frame + i
+        fd = load_frame_data_v2(data_dir, idx)
+        if fd is None: 
+            print(f"[Data Loader] Frame {idx} not found, stopping.")
+            break
+        if i % 2 == 0:
+            if not cfg.disable_bg:
+                static_q.put(fd)
+        dynamic_q.put(fd)
+        count += 1
+    print(f"[Data Loader] Loaded {count} frames.")
+    static_q.put(None)
+    dynamic_q.put(None)
+
+def static_scene_worker(cfg, bg_queue, data_q):
+    set_seed(cfg.seed)
+    from gs_scene.scene_model import SceneModel
+    try:
+        from old_ref.keyframe_window import KeyFrameWindow
+    except ImportError:
+        class KeyFrameWindowFallback:
+            def __init__(self, chunk_size, rr_log=True):
+                self.chunk_size = chunk_size
+                self.count = 0
+            def try_add_frame(self, frame, model):
+                if self.count % self.chunk_size == 0:
+                    self.count += 1
+                    return True
+                self.count += 1
+                return False
+        KeyFrameWindow = KeyFrameWindowFallback
+    
+    if not cfg.no_vis:
+        rr.init("FullSystem2", recording_id="dyn_gs_unified")
+        if not cfg.serve: rr.connect_grpc(cfg.rerun_url)
+
+    data_dir = Path(cfg.data_root) / cfg.clip_id
+    f0 = load_frame_data_v2(data_dir, cfg.init_frame)
+    if f0 is None: return
+    h, w = f0["image"].shape[:2]
+    scene_model = SceneModel(width=w, height=h, num_steps=cfg.num_steps_static, use_anchors=cfg.use_anchors, use_exposure=cfg.use_exposure, pyr_levels=cfg.pyr_levels_static, anchor_dist_threshold=cfg.anchor_dist_threshold, use_guided_mvs=cfg.use_guided_mvs, init_proba_scaler=cfg.init_proba_scaler)
+    keyframe_window = KeyFrameWindow(cfg.chunk_size, rr_log=not cfg.no_vis)
+    
+    while True:
+        fd = data_q.get()
+        if fd is None: break
+        idx = fd["frame_idx"]
+        img_np = fd["image"]
+        depth = fd["depth"] if fd["depth"] is not None else np.zeros((h, w), dtype=np.float32)
+        obj_mask = fd["mask"]; hand_mask = fd["hand_mask"]
+        dynamic_mask = np.zeros((h, w), dtype=bool)
+        if obj_mask is not None: dynamic_mask |= (obj_mask > 0)
+        if hand_mask is not None: dynamic_mask |= (hand_mask > 0)
+        static_mask = ~dynamic_mask
+        
+        if keyframe_window.try_add_frame({"image": img_np, "extrin": fd["extrin"], "K": fd["K"], "depth": depth, "obj_mask": obj_mask, "hand_mask": hand_mask}, scene_model):
+            with torch.enable_grad():
+                scene_model.update(img_np, depth, fd["extrin"], fd["K"], mask=static_mask)
+                if bg_queue is not None:
+                    shs = torch.cat([scene_model.gaussian_params["f_dc"]["val"], scene_model.gaussian_params["f_rest"]["val"]], dim=1)
+                    bg_queue.put({"means": scene_model.gaussian_params["xyz"]["val"].detach().cpu().numpy(), "quats": scene_model.gaussian_params["rotation"]["val"].detach().cpu().numpy(), "scales": scene_model.gaussian_params["scaling"]["val"].detach().cpu().numpy(), "colors": scene_model.gaussian_params["f_dc"]["val"].detach().cpu().numpy().squeeze(1), "opacity": scene_model.gaussian_params["opacity"]["val"].detach().cpu().numpy(), "shs": shs.detach().cpu().numpy()})
+            if not cfg.no_vis:
+                rr.set_time("frame_idx", sequence=idx)
+                xyz = scene_model.xyz.detach().cpu().numpy(); colors = scene_model.colors.detach().cpu().numpy().squeeze()
+                if len(xyz) > 0: rr.log("world/static/gs_points", rr.Points3D(xyz, colors=colors))
+
+def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
+    set_seed(cfg.seed)
+    print(f"[Dynamic Worker] Starting on {cfg.device}")
+    device = torch.device(cfg.device)
+    
+    # Initialize Tracker and Mapping configs for BundleSdfGS
+    tracker_cfg = GeoTrackerConfig(
+        feature_type=cfg.feature_type,
+        n_features=cfg.n_features,
+        use_photometric_refinement=cfg.use_photometric,
+        photometric_mode=cfg.photometric_mode,
+        n_init_frames=cfg.n_init_frames,
+        max_pose_jump=cfg.max_pose_jump,
+        informed_thresh=cfg.informed_thresh,
+        ransac_thresh=cfg.ransac_thresh,
+        grid_spacing=cfg.grid_spacing,
+        gs_type=cfg.gs_type,
+        use_informed_filtering=cfg.use_informed_filtering,
+        use_occlusion_check=cfg.use_occlusion_check,
+        min_kf_rot=cfg.min_kf_rot,
+        kf_overlap_thresh=cfg.kf_overlap_thresh,
+        min_kf_interval=cfg.min_kf_interval
+    )
+    
+    map_cfg = MappingConfig(
+        gs_type=cfg.gs_type,
+        device=cfg.device,
+        num_steps_per_frame=cfg.num_steps_dyn,
+        fix_color=cfg.fix_color,
+        fix_scale=cfg.fix_scale,
+        use_ray_dist=cfg.use_ray_dist,
+        multi_view_ncc_weight=cfg.multi_view_ncc_weight,
+        pyr_levels=cfg.pyr_levels,
+        densify_every=cfg.densify_every,
+        prune_every=cfg.prune_every,
+        mask_loss_weight=cfg.mask_loss_weight,
+        align_depth=cfg.align_depth,
+        align_with_bias=cfg.align_with_bias,
+        use_pgsr=cfg.use_pgsr,
+        seed=cfg.seed
+    )
+    
+    # Fetch first frame for dense initialization from depth prior
+    f0 = data_q.get()
+    if f0 is None: return
+    
+    # Dense initialization logic using Object-World coordinates
+    T_WO_gt_f0 = f0["T_WO_gt"]
+    T_CW_f0 = f0["extrin"]
+    T_CO_gt_f0 = T_CW_f0 @ T_WO_gt_f0 if T_WO_gt_f0 is not None else np.eye(4)
+    
+    color_f0 = f0["image"]
+    depth_f0 = f0["depth"]
+    mask_f0 = f0.get("mask")
+    if mask_f0 is None: mask_f0 = np.ones_like(depth_f0, dtype=bool)
+    else: mask_f0 = mask_f0 > 0
+    K_f0 = f0["K"]
+    
+    # Sample dense points from depth prior
+    iy, ix = np.where(mask_f0 & (depth_f0 > 0.01))
+    max_pts = 10000
+    if len(iy) > max_pts:
+        perm = np.random.choice(len(iy), max_pts, replace=False)
+        iy, ix = iy[perm], ix[perm]
+    
+    z = depth_f0[iy, ix]
+    fx, fy, cx, cy = K_f0[0, 0], K_f0[1, 1], K_f0[0, 2], K_f0[1, 2]
+    pts3d_c = np.stack([(ix - cx) * z / fx, (iy - cy) * z / fy, z], axis=-1)
+    
+    # Transform to Object space
+    T_OC0 = np.linalg.inv(T_CO_gt_f0)
+    pts3d_o = (pts3d_c @ T_OC0[:3, :3].T) + T_OC0[:3, 3]
+    colors_f0 = color_f0[iy, ix] / 255.0
+    
+    # Normals for GS orientation
+    depth_t = torch.from_numpy(depth_f0).float().cuda()
+    K_t = torch.from_numpy(K_f0).float().cuda()
+    full_pts_c = unproject_depth(depth_t, K_t, depth_f0.shape[0], depth_f0.shape[1])
+    normals_c_full, _ = d2n_tblr(full_pts_c.permute(2, 0, 1).unsqueeze(0))
+    normals_c = -F.normalize(normals_c_full[0][:, iy, ix].permute(1, 0), dim=1).cpu().numpy()
+    normals_o = (normals_c @ T_OC0[:3, :3].T)
+    
+    # Ray parameters for GS refinement
+    ray_o_o = torch.from_numpy(T_OC0[:3, 3]).float().cuda().view(1, 3).repeat(len(pts3d_o), 1)
+    ray_d_c = np.stack([(ix - cx) / fx, (iy - cy) / fy, np.ones_like(z)], axis=-1)
+    ray_d_c = ray_d_c / np.linalg.norm(ray_d_c, axis=-1, keepdims=True)
+    ray_d_o = torch.from_numpy(ray_d_c @ T_OC0[:3, :3].T).float().cuda()
+    ray_dist = torch.norm(torch.from_numpy(pts3d_c).float().cuda(), dim=-1, keepdim=True)
+    
+    initial_gs = init_gs_from_tracker_points(
+        pts3d_o, colors_f0, "cuda", normals=normals_o,
+        ray_o=ray_o_o, ray_d=ray_d_o, ray_dist=ray_dist,
+        gs_type=cfg.gs_type,
+        fx=fx, fy=fy
+    )
+
+    # Initialize BundleSdfGS with the dense prior
+    tracker = BundleSdfGS(tracker_cfg, map_cfg, use_multiprocessing=cfg.multiprocess_dyn, initial_gs=initial_gs)
+    
+    ates = []
+    psnrs = []
+    ssims = []
+    lpipss = []
+    est_T_WO = {}
+    pending_eval = None
+    last_static_gs_data = None
+    traj_obj_est_C, traj_obj_gt_C = [], []
+    eval_frames = []
+    
+    if not cfg.no_vis:
+        rr.init("FullSystem2", recording_id="dyn_gs_unified")
+        if not cfg.serve: rr.connect_grpc(cfg.rerun_url)
+
+    current_fd = f0
+    while True:
+        if current_fd is not None:
+            fd = current_fd
+            current_fd = None
+        else:
+            fd = data_q.get()
+        if fd is None: break
+        idx = fd["frame_idx"]
+        i = idx - cfg.init_frame
+        loop_start = time.time()
+        
+        # Poll background GS data
+        if not cfg.disable_bg:
+            while not bg_queue.empty():
+                try: last_static_gs_data = bg_queue.get_nowait()
+                except: break
+        
+        # Get GT for initialization or metric check
+        T_WO_gt = fd["T_WO_gt"]
+        T_CW_gt = fd["extrin"]
+        T_CO_gt = T_CW_gt @ T_WO_gt if T_WO_gt is not None else None
+        
+        if i % 2 == 0:
+            # ==========================================
+            # Tracking Frame
+            # ==========================================
+            # Subtract hand mask from object mask if available to avoid tracking hand features
+            obj_mask = fd["mask"]
+            if obj_mask is not None and fd["hand_mask"] is not None:
+                obj_mask = obj_mask.copy()
+                obj_mask[fd["hand_mask"] > 0] = 0
+                
+            res = tracker.run(
+                fd["image"], obj_mask, fd["depth"], fd["K"], 
+                T_CW=fd["extrin"],
+                T_WO_init=T_WO_gt if idx == cfg.init_frame else None,
+                return_render=True
+            )
+            if res is not None:
+                T_CO_est, img_fg_pkg = res
+                # Compute estimated object-in-world pose
+                T_WC_est = np.linalg.inv(fd["extrin"])
+                T_WO_est = T_WC_est @ T_CO_est
+                est_T_WO[i] = T_WO_est
+                
+                # Check for densification (if active)
+                if isinstance(img_fg_pkg, (list, tuple)) and len(img_fg_pkg) == 2:
+                    img_fg_torch, alpha_fg_torch = img_fg_pkg
+                elif isinstance(img_fg_pkg, torch.Tensor):
+                    img_fg_torch = img_fg_pkg
+                else:
+                    img_fg_torch = None
+                
+                if img_fg_torch is not None:
+                    target_image = torch.from_numpy(fd["image"]).float().to(device).permute(2, 0, 1) / 255.0
+                    mask_obj = fd["mask"]
+                    if mask_obj is not None:
+                        mask_obj_t = torch.from_numpy(mask_obj > 0).to(device)
+                        if mask_obj_t.any():
+                            obj_l1 = F.l1_loss(img_fg_torch.to(device)[:, mask_obj_t], target_image[:, mask_obj_t])
+                            if obj_l1 > cfg.densify_error_threshold:
+                                print(f"[ObjectGS] High photometric error (L1={obj_l1:.4f} > {cfg.densify_error_threshold}), triggering densification.")
+                                tracker.force_densify(fd["image"], fd["mask"], fd["depth"], fd["K"], T_CO_est)
+            
+            print(f"Tracking Frame {idx} processed.")
+            
+            # Now, if we just tracked frame i (where i >= 2), and we have a pending evaluation frame i - 1, 
+            # we can evaluate frame i - 1 using the poses from i - 2 and i!
+            if i >= 2 and pending_eval is not None:
+                eval_fd = pending_eval
+                eval_idx = eval_fd["frame_idx"]
+                eval_i = eval_idx - cfg.init_frame
+                h, w = eval_fd["image"].shape[:2]
+                
+                T_WO_prev = est_T_WO[eval_i - 1]
+                T_WO_next = est_T_WO[eval_i + 1]
+                
+                # Average translation
+                t_avg = 0.5 * (T_WO_prev[:3, 3] + T_WO_next[:3, 3])
+                
+                # Average rotation using Slerp
+                key_rots = R.from_matrix([T_WO_prev[:3, :3], T_WO_next[:3, :3]])
+                slerp = Slerp([0.0, 1.0], key_rots)
+                r_avg = slerp([0.5])[0]
+                R_avg = r_avg.as_matrix()
+                
+                # Assemble interpolated world pose
+                T_WO_eval = np.eye(4)
+                T_WO_eval[:3, :3] = R_avg
+                T_WO_eval[:3, 3] = t_avg
+                
+                # Convert to camera pose using known ground-truth camera extrinsics
+                T_CO_eval = eval_fd["extrin"] @ T_WO_eval
+                
+                # Render the object at T_CO_eval
+                img_fg_torch, alpha_fg_torch = tracker.render_current_view(eval_fd["K"], w, h, T_CO_eval)
+                if isinstance(img_fg_torch, (list, tuple)) and len(img_fg_torch) == 2:
+                    img_fg_torch, alpha_fg_torch = img_fg_torch
+                elif isinstance(img_fg_torch, torch.Tensor) and alpha_fg_torch is None:
+                    alpha_fg_torch = (img_fg_torch.sum(dim=0, keepdim=True) > 0.001).float()
+                
+                # Background rendering
+                img_bg = torch.zeros(3, h, w, device=device)
+                alpha_bg = torch.zeros(1, h, w, device=device)
+                
+                if not cfg.disable_bg and last_static_gs_data is not None:
+                    static_gs = GSParam(
+                        means=torch.from_numpy(last_static_gs_data["means"]).float().to(device),
+                        quats=torch.from_numpy(last_static_gs_data["quats"]).float().to(device),
+                        scales=torch.from_numpy(last_static_gs_data["scales"]).float().to(device),
+                        colors=torch.from_numpy(last_static_gs_data["colors"]).float().to(device),
+                        opacity=torch.from_numpy(last_static_gs_data["opacity"]).float().to(device),
+                        shs=torch.from_numpy(last_static_gs_data["shs"]).float().to(device) if last_static_gs_data.get("shs") is not None else None
+                    )
+                    img_bg, _, _, alpha_bg = static_gs.render(torch.from_numpy(eval_fd["extrin"]).float().to(device), torch.from_numpy(eval_fd["K"]).float().to(device), w, h, mode="3dgs")
+                
+                if img_fg_torch is not None:
+                    img_fg = img_fg_torch.to(device)
+                    alpha_fg = alpha_fg_torch.to(device)
+                else:
+                    img_fg = torch.zeros(3, h, w, device=device)
+                    alpha_fg = torch.zeros(1, h, w, device=device)
+                
+                # Composite Rendered Image
+                if cfg.use_alpha_blending:
+                    img_render = img_fg + img_bg * (1 - alpha_fg)
+                else:
+                    img_render = img_bg.clone()
+                    mask_obj = eval_fd["mask"]
+                    if mask_obj is not None:
+                        mask_obj_t = torch.from_numpy(mask_obj > 0).to(device)
+                        img_render[:, mask_obj_t] = img_fg[:, mask_obj_t]
+                    else:
+                        img_render[:, alpha_fg[0] > 0.1] = img_fg[:, alpha_fg[0] > 0.1]
+                
+                img_render = torch.clamp(img_render, 0, 1)
+                
+                # Calculate metrics
+                target_image = torch.from_numpy(eval_fd["image"]).float().to(device).permute(2, 0, 1) / 255.0
+                
+                # Accounts for GT hand mask by overlaying GT hand pixels
+                if cfg.use_hand_mask and eval_fd.get("hand_mask") is not None:
+                    hand_mask = eval_fd["hand_mask"]
+                    hand_mask_t = torch.from_numpy(hand_mask > 0).to(device)
+                    img_render[:, hand_mask_t] = target_image[:, hand_mask_t]
+                    
+                psnr = -10.0 * torch.log10(torch.mean((img_render - target_image)**2) + 1e-10)
+                psnrs.append(psnr.item())
+                ssim = fused_ssim(img_render.unsqueeze(0), target_image.unsqueeze(0)).item()
+                ssims.append(ssim)
+                
+                lpips_val = lpips(img_render.unsqueeze(0), target_image.unsqueeze(0), net_type='vgg').item()
+                lpipss.append(lpips_val)
+                
+                T_WO_eval_gt = eval_fd["T_WO_gt"]
+                if T_WO_eval_gt is not None:
+                    T_CO_eval_gt = eval_fd["extrin"] @ T_WO_eval_gt
+                    ate = np.linalg.norm(T_CO_eval[:3, 3] - T_CO_eval_gt[:3, 3])
+                else:
+                    ate = 0.0
+                ates.append(ate)
+                
+                print(f"Evaluation Frame {eval_idx}: ATE={ate:.4f}, PSNR={psnr.item():.2f}, SSIM={ssim:.4f}, LPIPS={lpips_val:.4f}")
+                
+                # Optional visualization concatenation and save
+                if cfg.save_render:
+                    rendered_np = (img_render.permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    gt_np = eval_fd["image"]
+                    concat_img = np.concatenate([gt_np, rendered_np], axis=1)
+                    concat_img_bgr = cv2.cvtColor(concat_img, cv2.COLOR_RGB2BGR)
+                    os.makedirs(cfg.render_dir, exist_ok=True)
+                    save_path = os.path.join(cfg.render_dir, f"eval_{eval_idx:04d}.png")
+                    cv2.imwrite(save_path, concat_img_bgr)
+                    print(f"[Visualization] Saved concatenated image to {save_path}")
+                    eval_frames.append(concat_img_bgr)
+
+                # Rerun visualization for evaluation frames
+                if not cfg.no_vis:
+                    rr.set_time("frame_idx", sequence=eval_idx)
+                    img_np = (img_render.permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    rr.log("input/image", rr.Image(eval_fd["image"]).compress(jpeg_quality=50))
+                    rr.log("output/combined", rr.Image(img_np).compress(jpeg_quality=50))
+                    rr.log("output/ate", rr.Scalars(ate))
+                    rr.log("output/psnr", rr.Scalars(psnr.item()))
+                    rr.log("output/ssim", rr.Scalars(ssim))
+                    rr.log("output/lpips", rr.Scalars(lpips_val))
+                    
+                    T_OC_est = np.linalg.inv(T_CO_eval)
+                    rr.log("object/tracker/camera", rr.Transform3D(mat3x3=T_OC_est[:3, :3], translation=T_OC_est[:3, 3]))
+                    traj_obj_est_C.append(T_OC_est[:3, 3])
+                    rr.log("object/tracker/traj_est", rr.LineStrips3D([np.array(traj_obj_est_C)], colors=[[0, 255, 0]], radii=0.003))
+                    
+                    if T_WO_eval_gt is not None:
+                        T_OC_gt = np.linalg.inv(T_CO_eval_gt)
+                        traj_obj_gt_C.append(T_OC_gt[:3, 3])
+                        rr.log("object/camera_gt", rr.Transform3D(mat3x3=T_OC_gt[:3, :3], translation=T_OC_gt[:3, 3]))
+                        rr.log("object/traj_gt", rr.LineStrips3D([np.array(traj_obj_gt_C)], colors=[[255, 255, 255]], radii=0.003))
+                    
+                    if tracker.obj_gs is not None:
+                        pts_O = tracker.obj_gs.gs_params.means.detach().cpu().numpy()
+                        if tracker.obj_gs.gs_params.shs is not None:
+                            cols_sh = tracker.obj_gs.gs_params.shs.detach().cpu().numpy()
+                            if cols_sh.ndim == 3: cols_sh = cols_sh[:, 0, :]
+                            cols_rgb = np.clip(cols_sh * 0.28209479177387814 + 0.5, 0, 1)
+                        else:
+                            cols_logit = tracker.obj_gs.gs_params.colors.detach()
+                            cols_rgb = torch.sigmoid(cols_logit).cpu().numpy()
+                        rr.log("object/gs", rr.Points3D(pts_O, colors=cols_rgb))
+                    
+                    # World visualization
+                    T_WC_est = np.linalg.inv(eval_fd["extrin"])
+                    rr.log("world/camera", rr.Transform3D(mat3x3=T_WC_est[:3, :3], translation=T_WC_est[:3, 3]))
+                    rr.log(
+                        "world/camera/pinhole",
+                        rr.Pinhole(image_from_camera=eval_fd["K"], width=w, height=h),
+                    )
+                    rr.log("world/camera/pinhole/image", rr.Image(eval_fd["image"]).compress(jpeg_quality=50))
+                    
+                    T_WO_est = T_WC_est @ T_CO_eval
+                    rr.log("world/object", rr.Transform3D(mat3x3=T_WO_est[:3, :3], translation=T_WO_est[:3, 3]))
+                    if tracker.obj_gs is not None:
+                        rr.log("world/object/gs", rr.Points3D(pts_O, colors=cols_rgb))
+                
+                pending_eval = None
+        else:
+            # ==========================================
+            # Evaluation Frame (Odd Index)
+            # ==========================================
+            # Buffer the frame and wait for the next tracking frame to complete
+            pending_eval = fd
+            print(f"Evaluation Frame {idx} buffered.")
+
+    if ates: print(f"\n>>> Final Mean ATE: {np.mean(ates):.4f}m")
+    if psnrs: print(f">>> Final Mean PSNR: {np.mean(psnrs):.2f}dB")
+    if ssims: print(f">>> Final Mean SSIM: {np.mean(ssims):.4f}")
+    if lpipss: print(f">>> Final Mean LPIPS: {np.mean(lpipss):.4f}")
+    
+    if cfg.save_render and len(eval_frames) > 0:
+        video_path = Path(cfg.render_dir) / f"eval_render_{cfg.clip_id.replace('/', '_')}.mp4"
+        h, w = eval_frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(video_path), fourcc, 15.0, (w, h))
+        for frame in eval_frames:
+            out.write(frame)
+        out.release()
+        print(f"[Visualization] Saved concatenated evaluation video to {video_path}")
+        
+    tracker.on_finish()
+
+def main():
+    try: mp.set_start_method('spawn', force=True)
+    except: pass
+    
+    cfg = tyro.cli(GlobalConfig)
+    set_seed(cfg.seed)
+    ctx = mp.get_context('spawn')
+    
+    bg_queue = ctx.Queue(maxsize=10)
+    static_q = ctx.Queue(maxsize=10)
+    dynamic_q = ctx.Queue(maxsize=10)
+    
+    p_loader = ctx.Process(target=data_loader_worker, args=(cfg, static_q, dynamic_q))
+    p_static = ctx.Process(target=static_scene_worker, args=(cfg, bg_queue, static_q))
+    p_dynamic = ctx.Process(target=dynamic_worker, args=(cfg, bg_queue, dynamic_q))
+    
+    p_loader.start()
+    if not cfg.disable_bg:
+        p_static.start()
+    p_dynamic.start()
+    
+    if not cfg.no_vis:
+        rr.init("FullSystem2", recording_id="dyn_gs_unified")
+        if not cfg.serve: rr.connect_grpc(cfg.rerun_url)
+        rr.send_blueprint(rrb.Blueprint(
+            rrb.Vertical(
+                rrb.Horizontal(
+                    rrb.Spatial2DView(origin="input/image", name="Input"),
+                    rrb.Spatial2DView(origin="output/combined", name="Render"),
+                ),
+                rrb.Horizontal(
+                    rrb.Spatial3DView(origin="object", name="Object-Centric"),
+                    rrb.Spatial3DView(origin="world", name="World View"),
+                ),
+            ),
+            collapse_panels=True
+        ))
+
+    p_loader.join()
+    if not cfg.disable_bg:
+        p_static.join()
+    p_dynamic.join()
+
+if __name__ == "__main__":
+    main()

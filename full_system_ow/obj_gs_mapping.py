@@ -28,15 +28,16 @@ from gs_dyn_obj.grouped_gs import GaussianSuperPrimitive, RGB2SH
 from gs_dyn_obj.gs_param import GSParam
 from gs_dyn_obj.utils.init import unproject_depth, d2n_tblr
 from gs_dyn_obj.gs_rendering import render_2dgs
+from gs_dyn_obj.utils.ssim import ssim
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply, quaternion_to_matrix
 
 from run_single_view_loss import compute_single_view_loss
 from run_multi_view_loss import compute_multi_view_loss
 
 # Import PGSR-style loss utilities
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / "third_party" / "PGSR"))
-from utils.loss_utils import ssim, lncc, get_img_grad_weight
+# import sys
+# sys.path.insert(0, str(Path(__file__).parent.parent / "third_party" / "PGSR"))
+# from utils.loss_utils import ssim, lncc, get_img_grad_weight
 
 @dataclass
 class MappingConfig:
@@ -235,7 +236,7 @@ def build_rotation_from_normal(normal):
     R[flip_mask, :, 1] *= -1
     return matrix_to_quaternion(R)
 
-def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None, ray_d=None, ray_dist=None, gs_type="2d"):
+def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None, ray_d=None, ray_dist=None, gs_type="2d", fx=None, fy=None, pixel_size=1.0):
     num_pts = points.shape[0]
     means = torch.from_numpy(points).float().to(device)
     colors_rgb = torch.from_numpy(colors).float().to(device)
@@ -249,10 +250,26 @@ def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None
     else:
         quats = torch.zeros((num_pts, 4), device=device); quats[:, 0] = 1.0
     
-    if gs_type == "3d" or gs_type == "normal":
-        scales = (torch.ones((num_pts, 3), device=device) * 0.02).log()
+    # Determine scale dynamically using perspective projection (matching SceneModel logic)
+    if fx is None or fy is None:
+        f_avg = 500.0
     else:
-        scales = (torch.ones((num_pts, 2), device=device) * 0.02).log()
+        f_avg = 0.5 * (fx + fy)
+        
+    angular_factor = pixel_size / f_avg
+    
+    if ray_dist is not None:
+        ray_dist_t = torch.from_numpy(ray_dist).float().to(device) if isinstance(ray_dist, np.ndarray) else ray_dist.float().to(device)
+        physical_scale = angular_factor * ray_dist_t.squeeze(-1)
+    else:
+        physical_scale = torch.ones(num_pts, device=device) * (angular_factor * 0.5)
+        
+    physical_scale = physical_scale.clamp(1e-6, 1e6)
+    
+    if gs_type == "3d" or gs_type == "normal":
+        scales = torch.log(physical_scale.unsqueeze(-1).repeat(1, 3))
+    else:
+        scales = torch.log(physical_scale.unsqueeze(-1).repeat(1, 2))
         
     opacity = torch.logit(torch.ones((num_pts, 1), device=device) * 0.7)
     shs = colors_sh.unsqueeze(1).detach() if colors_sh.dim()==2 else colors_sh.detach()
@@ -514,7 +531,7 @@ class GSMapping:
                 new_quats = build_rotation_from_normal(new_normals_o)
                 sampled_init_proba = init_proba[y, x].clamp_min(1e-6)
                 # Use a much smaller scale for new points (similar to initialization, ~1 pixel size)
-                new_sizes = (1.0 / torch.sqrt(sampled_init_proba)).clamp(0.2, 2.0) * (z / ((fx+fy)/2))
+                new_sizes = (1.0 / torch.sqrt(sampled_init_proba)).clamp(0.1, 1.0) * (z / ((fx+fy)/2))
                 
                 if self.cfg.gs_type == "3d":
                     new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 3).clamp(1e-6, 1e6))
@@ -739,7 +756,7 @@ class GSMapping:
     def refine_pose(self, image_t, mask_t, cam, T_CO_init, steps=60):
         """Optimizes T_CO and scale to align the GS model with the current image using a pyramid approach."""
         import torch.optim as optim
-        from utils.loss_utils import ssim
+        from gs_dyn_obj.utils.ssim import ssim
         device = self.cfg.device
         
         def matrix_to_se3(T):

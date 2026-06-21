@@ -43,6 +43,8 @@ from gs_dyn_obj.gs_param import GSParam
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply
 from gs_scene.optimizers import fused_ssim
 import rerun.blueprint as rrb
+from scipy.spatial.transform import Rotation as R, Slerp
+from lpipsPyTorch import lpips
 
 # Background Scene Model
 from gs_scene.scene_model import SceneModel
@@ -85,6 +87,9 @@ class GlobalConfig:
     debug: bool = False
     separate_render: bool = True
     use_alpha_blending: bool = True
+    save_render: bool = False
+    render_dir: str = "renders"
+    use_hand_mask: bool = True
     
     # Static BG specific
     chunk_size: int = 4
@@ -240,8 +245,9 @@ def data_loader_worker(cfg, static_q, dynamic_q):
         if fd is None: 
             print(f"[Data Loader] Frame {idx} not found, stopping.")
             break
-        if not cfg.disable_bg:
-            static_q.put(fd)
+        if i % 2 == 0:
+            if not cfg.disable_bg:
+                static_q.put(fd)
         dynamic_q.put(fd)
         count += 1
     print(f"[Data Loader] Loaded {count} frames.")
@@ -402,8 +408,12 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
     ates = []
     psnrs = []
     ssims = []
+    lpipss = []
+    est_T_WO = {}
+    pending_eval = None
     last_static_gs_data = None
     traj_obj_est_C, traj_obj_gt_C = [], []
+    eval_frames = []
     
     if not cfg.no_vis:
         rr.init("FullSystem2", recording_id="dyn_gs_unified")
@@ -418,6 +428,7 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
             fd = data_q.get()
         if fd is None: break
         idx = fd["frame_idx"]
+        i = idx - cfg.init_frame
         loop_start = time.time()
         
         # Poll background GS data
@@ -426,153 +437,236 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
                 try: last_static_gs_data = bg_queue.get_nowait()
                 except: break
         
-        # Get GT for initialization if first frame
+        # Get GT for initialization or metric check
         T_WO_gt = fd["T_WO_gt"]
         T_CW_gt = fd["extrin"]
         T_CO_gt = T_CW_gt @ T_WO_gt if T_WO_gt is not None else None
         
-        # Run BundleSdfGS
-        # Subtract hand mask from object mask if available to avoid tracking hand features
-        obj_mask = fd["mask"]
-        if obj_mask is not None and fd["hand_mask"] is not None:
-            obj_mask = obj_mask.copy()
-            obj_mask[fd["hand_mask"] > 0] = 0
-            
-        res = tracker.run(
-            fd["image"], obj_mask, fd["depth"], fd["K"], 
-            T_CW=fd["extrin"],
-            T_WO_init=T_WO_gt if idx == cfg.init_frame else None,
-            return_render=True
-        )
-        if res is None: continue
-        T_CO_est, img_fg_pkg = res
-        if isinstance(img_fg_pkg, (list, tuple)) and len(img_fg_pkg) == 2:
-            img_fg_torch, alpha_fg_torch = img_fg_pkg
-        elif isinstance(img_fg_pkg, torch.Tensor):
-            img_fg_torch = img_fg_pkg
-            alpha_fg_torch = (img_fg_torch.sum(dim=0, keepdim=True) > 0.001).float()
-        else:
-            img_fg_torch, alpha_fg_torch = None, None
-        
-        # Background Rendering and Compositing
-        h, w = fd["image"].shape[:2]
-        img_bg = torch.zeros(3, h, w, device=device)
-        alpha_bg = torch.zeros(1, h, w, device=device)
-        
-        if not cfg.disable_bg and last_static_gs_data is not None:
-            static_gs = GSParam(
-                means=torch.from_numpy(last_static_gs_data["means"]).float().to(device),
-                quats=torch.from_numpy(last_static_gs_data["quats"]).float().to(device),
-                scales=torch.from_numpy(last_static_gs_data["scales"]).float().to(device),
-                colors=torch.from_numpy(last_static_gs_data["colors"]).float().to(device),
-                opacity=torch.from_numpy(last_static_gs_data["opacity"]).float().to(device),
-                shs=torch.from_numpy(last_static_gs_data["shs"]).float().to(device) if last_static_gs_data.get("shs") is not None else None
+        if i % 2 == 0:
+            # ==========================================
+            # Tracking Frame
+            # ==========================================
+            # Subtract hand mask from object mask if available to avoid tracking hand features
+            obj_mask = fd["mask"]
+            if obj_mask is not None and fd["hand_mask"] is not None:
+                obj_mask = obj_mask.copy()
+                obj_mask[fd["hand_mask"] > 0] = 0
+                
+            res = tracker.run(
+                fd["image"], obj_mask, fd["depth"], fd["K"], 
+                T_CW=fd["extrin"],
+                T_WO_init=T_WO_gt if idx == cfg.init_frame else None,
+                return_render=True
             )
-            img_bg, _, _, alpha_bg = static_gs.render(torch.from_numpy(fd["extrin"]).float().to(device), torch.from_numpy(fd["K"]).float().to(device), w, h, mode="3dgs")
-
-        if img_fg_torch is not None:
-            img_fg = img_fg_torch.to(device)
-            alpha_fg = alpha_fg_torch.to(device)
-        else:
-            img_fg = torch.zeros(3, h, w, device=device)
-            alpha_fg = torch.zeros(1, h, w, device=device)
-        
-        if cfg.use_alpha_blending:
-            img_render = img_fg + img_bg * (1 - alpha_fg)
-        else:
-            img_render = img_bg.clone()
-            mask_obj = fd["mask"]
-            if mask_obj is not None:
-                mask_obj_t = torch.from_numpy(mask_obj > 0).to(device)
-                img_render[:, mask_obj_t] = img_fg[:, mask_obj_t]
-            else:
-                img_render[:, alpha_fg[0] > 0.1] = img_fg[:, alpha_fg[0] > 0.1]
-        
-        img_render = torch.clamp(img_render, 0, 1)
-        
-        # Metrics and Logging
-        ate = np.linalg.norm(T_CO_est[:3, 3] - T_CO_gt[:3, 3]) if T_CO_gt is not None else 0.0
-        ates.append(ate)
-        target_image = torch.from_numpy(fd["image"]).float().to(device).permute(2, 0, 1) / 255.0
-        psnr = -10.0 * torch.log10(torch.mean((img_render - target_image)**2) + 1e-10)
-        psnrs.append(psnr.item())
-        ssim = fused_ssim(img_render.unsqueeze(0), target_image.unsqueeze(0)).item()
-        ssims.append(ssim)
-        
-        # Object-area Photometric Error Check for Densification
-        mask_obj = fd["mask"]
-        if mask_obj is not None:
-            mask_obj_t = torch.from_numpy(mask_obj > 0).to(device)
-            if mask_obj_t.any() and img_fg_torch is not None:
-                obj_l1 = F.l1_loss(img_fg[:, mask_obj_t], target_image[:, mask_obj_t])
-                if obj_l1 > cfg.densify_error_threshold:
-                    print(f"[ObjectGS] High photometric error (L1={obj_l1:.4f} > {cfg.densify_error_threshold}), triggering densification.")
-                    tracker.force_densify(fd["image"], fd["mask"], fd["depth"], fd["K"], T_CO_est)
-        
-        if idx % 10 == 0:
-            print(f"Frame {idx}: ATE={ate:.4f}, PSNR={psnr.item():.2f}, SSIM={ssim:.3f}, FPS={1.0/(time.time()-loop_start):.2f}")
-
-        if not cfg.no_vis:
-            rr.set_time("frame_idx", sequence=idx)
-            img_np = (img_render.permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            rr.log("input/image", rr.Image(fd["image"]).compress(jpeg_quality=50))
-            rr.log("output/combined", rr.Image(img_np).compress(jpeg_quality=50))
-            rr.log("output/ate", rr.Scalars(ate))
-            rr.log("output/psnr", rr.Scalars(psnr.item()))
-            rr.log("output/ssim", rr.Scalars(ssim))
-            
-            T_OC_est = np.linalg.inv(T_CO_est)
-            rr.log("object/tracker/camera", rr.Transform3D(mat3x3=T_OC_est[:3, :3], translation=T_OC_est[:3, 3]))
-            traj_obj_est_C.append(T_OC_est[:3, 3])
-            rr.log("object/tracker/traj_est", rr.LineStrips3D([np.array(traj_obj_est_C)], colors=[[0, 255, 0]], radii=0.003))
-            
-            if T_CO_gt is not None:
-                T_OC_gt = np.linalg.inv(T_CO_gt)
-                traj_obj_gt_C.append(T_OC_gt[:3, 3])
-                rr.log("object/camera_gt", rr.Transform3D(mat3x3=T_OC_gt[:3, :3], translation=T_OC_gt[:3, 3]))
-                rr.log("object/traj_gt", rr.LineStrips3D([np.array(traj_obj_gt_C)], colors=[[255, 255, 255]], radii=0.003))
-
-            if tracker.obj_gs is not None:
-                pts_O = tracker.obj_gs.gs_params.means.detach().cpu().numpy()
-                if tracker.obj_gs.gs_params.shs is not None:
-                    cols_sh = tracker.obj_gs.gs_params.shs.detach().cpu().numpy()
-                    if cols_sh.ndim == 3: cols_sh = cols_sh[:, 0, :]
-                    cols_rgb = np.clip(cols_sh * 0.28209479177387814 + 0.5, 0, 1)
+            if res is not None:
+                T_CO_est, img_fg_pkg = res
+                # Compute estimated object-in-world pose
+                T_WC_est = np.linalg.inv(fd["extrin"])
+                T_WO_est = T_WC_est @ T_CO_est
+                est_T_WO[i] = T_WO_est
+                
+                # Check for densification (if active)
+                if isinstance(img_fg_pkg, (list, tuple)) and len(img_fg_pkg) == 2:
+                    img_fg_torch, alpha_fg_torch = img_fg_pkg
+                elif isinstance(img_fg_pkg, torch.Tensor):
+                    img_fg_torch = img_fg_pkg
                 else:
-                    cols_logit = tracker.obj_gs.gs_params.colors.detach()
-                    cols_rgb = torch.sigmoid(cols_logit).cpu().numpy()
-                rr.log("object/gs", rr.Points3D(pts_O, colors=cols_rgb))
+                    img_fg_torch = None
+                
+                if img_fg_torch is not None:
+                    target_image = torch.from_numpy(fd["image"]).float().to(device).permute(2, 0, 1) / 255.0
+                    mask_obj = fd["mask"]
+                    if mask_obj is not None:
+                        mask_obj_t = torch.from_numpy(mask_obj > 0).to(device)
+                        if mask_obj_t.any():
+                            obj_l1 = F.l1_loss(img_fg_torch.to(device)[:, mask_obj_t], target_image[:, mask_obj_t])
+                            if obj_l1 > cfg.densify_error_threshold:
+                                print(f"[ObjectGS] High photometric error (L1={obj_l1:.4f} > {cfg.densify_error_threshold}), triggering densification.")
+                                tracker.force_densify(fd["image"], fd["mask"], fd["depth"], fd["K"], T_CO_est)
             
-            # World visualization
-            T_WC_est = np.linalg.inv(fd["extrin"])
-            T_WO_est = T_WC_est @ T_CO_est
+            print(f"Tracking Frame {idx} processed.")
             
-            # Log Camera trajectory and pose in World
-            rr.log("world/camera", rr.Transform3D(mat3x3=T_WC_est[:3, :3], translation=T_WC_est[:3, 3]))
-            
-            # Log Pinhole and Image to the camera
-            h, w = fd["image"].shape[:2]
-            rr.log(
-                "world/camera/pinhole",
-                rr.Pinhole(
-                    image_from_camera=fd["K"],
-                    width=w,
-                    height=h,
-                ),
-            )
-            rr.log("world/camera/pinhole/image", rr.Image(fd["image"]).compress(jpeg_quality=50))
+            # Now, if we just tracked frame i (where i >= 2), and we have a pending evaluation frame i - 1, 
+            # we can evaluate frame i - 1 using the poses from i - 2 and i!
+            if i >= 2 and pending_eval is not None:
+                eval_fd = pending_eval
+                eval_idx = eval_fd["frame_idx"]
+                eval_i = eval_idx - cfg.init_frame
+                h, w = eval_fd["image"].shape[:2]
+                
+                T_WO_prev = est_T_WO[eval_i - 1]
+                T_WO_next = est_T_WO[eval_i + 1]
+                
+                # Average translation
+                t_avg = 0.5 * (T_WO_prev[:3, 3] + T_WO_next[:3, 3])
+                
+                # Average rotation using Slerp
+                key_rots = R.from_matrix([T_WO_prev[:3, :3], T_WO_next[:3, :3]])
+                slerp = Slerp([0.0, 1.0], key_rots)
+                r_avg = slerp([0.5])[0]
+                R_avg = r_avg.as_matrix()
+                
+                # Assemble interpolated world pose
+                T_WO_eval = np.eye(4)
+                T_WO_eval[:3, :3] = R_avg
+                T_WO_eval[:3, 3] = t_avg
+                
+                # Convert to camera pose using known ground-truth camera extrinsics
+                T_CO_eval = eval_fd["extrin"] @ T_WO_eval
+                
+                # Render the object at T_CO_eval
+                img_fg_torch, alpha_fg_torch = tracker.render_current_view(eval_fd["K"], w, h, T_CO_eval)
+                if isinstance(img_fg_pkg, (list, tuple)) and len(img_fg_pkg) == 2:
+                    img_fg_torch, alpha_fg_torch = img_fg_pkg
+                elif isinstance(img_fg_torch, torch.Tensor) and alpha_fg_torch is None:
+                    alpha_fg_torch = (img_fg_torch.sum(dim=0, keepdim=True) > 0.001).float()
+                
+                # Background rendering
+                img_bg = torch.zeros(3, h, w, device=device)
+                alpha_bg = torch.zeros(1, h, w, device=device)
+                
+                if not cfg.disable_bg and last_static_gs_data is not None:
+                    static_gs = GSParam(
+                        means=torch.from_numpy(last_static_gs_data["means"]).float().to(device),
+                        quats=torch.from_numpy(last_static_gs_data["quats"]).float().to(device),
+                        scales=torch.from_numpy(last_static_gs_data["scales"]).float().to(device),
+                        colors=torch.from_numpy(last_static_gs_data["colors"]).float().to(device),
+                        opacity=torch.from_numpy(last_static_gs_data["opacity"]).float().to(device),
+                        shs=torch.from_numpy(last_static_gs_data["shs"]).float().to(device) if last_static_gs_data.get("shs") is not None else None
+                    )
+                    img_bg, _, _, alpha_bg = static_gs.render(torch.from_numpy(eval_fd["extrin"]).float().to(device), torch.from_numpy(eval_fd["K"]).float().to(device), w, h, mode="3dgs")
+                
+                if img_fg_torch is not None:
+                    img_fg = img_fg_torch.to(device)
+                    alpha_fg = alpha_fg_torch.to(device)
+                else:
+                    img_fg = torch.zeros(3, h, w, device=device)
+                    alpha_fg = torch.zeros(1, h, w, device=device)
+                
+                # Composite Rendered Image
+                if cfg.use_alpha_blending:
+                    img_render = img_fg + img_bg * (1 - alpha_fg)
+                else:
+                    img_render = img_bg.clone()
+                    mask_obj = eval_fd["mask"]
+                    if mask_obj is not None:
+                        mask_obj_t = torch.from_numpy(mask_obj > 0).to(device)
+                        img_render[:, mask_obj_t] = img_fg[:, mask_obj_t]
+                    else:
+                        img_render[:, alpha_fg[0] > 0.1] = img_fg[:, alpha_fg[0] > 0.1]
+                
+                img_render = torch.clamp(img_render, 0, 1)
+                
+                # Calculate metrics
+                target_image = torch.from_numpy(eval_fd["image"]).float().to(device).permute(2, 0, 1) / 255.0
+                
+                # Accounts for GT hand mask by overlaying GT hand pixels
+                if cfg.use_hand_mask and eval_fd.get("hand_mask") is not None:
+                    hand_mask = eval_fd["hand_mask"]
+                    hand_mask_t = torch.from_numpy(hand_mask > 0).to(device)
+                    img_render[:, hand_mask_t] = target_image[:, hand_mask_t]
+                    
+                psnr = -10.0 * torch.log10(torch.mean((img_render - target_image)**2) + 1e-10)
+                psnrs.append(psnr.item())
+                ssim = fused_ssim(img_render.unsqueeze(0), target_image.unsqueeze(0)).item()
+                ssims.append(ssim)
+                
+                lpips_val = lpips(img_render.unsqueeze(0), target_image.unsqueeze(0), net_type='vgg').item()
+                lpipss.append(lpips_val)
+                
+                T_WO_eval_gt = eval_fd["T_WO_gt"]
+                if T_WO_eval_gt is not None:
+                    T_CO_eval_gt = eval_fd["extrin"] @ T_WO_eval_gt
+                    ate = np.linalg.norm(T_CO_eval[:3, 3] - T_CO_eval_gt[:3, 3])
+                else:
+                    ate = 0.0
+                ates.append(ate)
+                
+                print(f"Evaluation Frame {eval_idx}: ATE={ate:.4f}, PSNR={psnr.item():.2f}, SSIM={ssim:.4f}, LPIPS={lpips_val:.4f}")
+                
+                # Optional visualization concatenation and save
+                if cfg.save_render:
+                    rendered_np = (img_render.permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    gt_np = eval_fd["image"]
+                    concat_img = np.concatenate([gt_np, rendered_np], axis=1)
+                    concat_img_bgr = cv2.cvtColor(concat_img, cv2.COLOR_RGB2BGR)
+                    os.makedirs(cfg.render_dir, exist_ok=True)
+                    save_path = os.path.join(cfg.render_dir, f"eval_{eval_idx:04d}.png")
+                    cv2.imwrite(save_path, concat_img_bgr)
+                    print(f"[Visualization] Saved concatenated image to {save_path}")
+                    eval_frames.append(concat_img_bgr)
 
-            # Log Object pose in World
-            rr.log("world/object", rr.Transform3D(mat3x3=T_WO_est[:3, :3], translation=T_WO_est[:3, 3]))
-            
-            # Re-log Object GS under world/object so it appears in world coordinates
-            if tracker.obj_gs is not None:
-                # pts_O and cols_rgb are already computed above
-                rr.log("world/object/gs", rr.Points3D(pts_O, colors=cols_rgb))
+                # Rerun visualization for evaluation frames
+                if not cfg.no_vis:
+                    rr.set_time("frame_idx", sequence=eval_idx)
+                    img_np = (img_render.permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    rr.log("input/image", rr.Image(eval_fd["image"]).compress(jpeg_quality=50))
+                    rr.log("output/combined", rr.Image(img_np).compress(jpeg_quality=50))
+                    rr.log("output/ate", rr.Scalars(ate))
+                    rr.log("output/psnr", rr.Scalars(psnr.item()))
+                    rr.log("output/ssim", rr.Scalars(ssim))
+                    rr.log("output/lpips", rr.Scalars(lpips_val))
+                    
+                    T_OC_est = np.linalg.inv(T_CO_eval)
+                    rr.log("object/tracker/camera", rr.Transform3D(mat3x3=T_OC_est[:3, :3], translation=T_OC_est[:3, 3]))
+                    traj_obj_est_C.append(T_OC_est[:3, 3])
+                    rr.log("object/tracker/traj_est", rr.LineStrips3D([np.array(traj_obj_est_C)], colors=[[0, 255, 0]], radii=0.003))
+                    
+                    if T_WO_eval_gt is not None:
+                        T_OC_gt = np.linalg.inv(T_CO_eval_gt)
+                        traj_obj_gt_C.append(T_OC_gt[:3, 3])
+                        rr.log("object/camera_gt", rr.Transform3D(mat3x3=T_OC_gt[:3, :3], translation=T_OC_gt[:3, 3]))
+                        rr.log("object/traj_gt", rr.LineStrips3D([np.array(traj_obj_gt_C)], colors=[[255, 255, 255]], radii=0.003))
+                    
+                    if tracker.obj_gs is not None:
+                        pts_O = tracker.obj_gs.gs_params.means.detach().cpu().numpy()
+                        if tracker.obj_gs.gs_params.shs is not None:
+                            cols_sh = tracker.obj_gs.gs_params.shs.detach().cpu().numpy()
+                            if cols_sh.ndim == 3: cols_sh = cols_sh[:, 0, :]
+                            cols_rgb = np.clip(cols_sh * 0.28209479177387814 + 0.5, 0, 1)
+                        else:
+                            cols_logit = tracker.obj_gs.gs_params.colors.detach()
+                            cols_rgb = torch.sigmoid(cols_logit).cpu().numpy()
+                        rr.log("object/gs", rr.Points3D(pts_O, colors=cols_rgb))
+                    
+                    # World visualization
+                    T_WC_est = np.linalg.inv(eval_fd["extrin"])
+                    rr.log("world/camera", rr.Transform3D(mat3x3=T_WC_est[:3, :3], translation=T_WC_est[:3, 3]))
+                    rr.log(
+                        "world/camera/pinhole",
+                        rr.Pinhole(image_from_camera=eval_fd["K"], width=w, height=h),
+                    )
+                    rr.log("world/camera/pinhole/image", rr.Image(eval_fd["image"]).compress(jpeg_quality=50))
+                    
+                    T_WO_est = T_WC_est @ T_CO_eval
+                    rr.log("world/object", rr.Transform3D(mat3x3=T_WO_est[:3, :3], translation=T_WO_est[:3, 3]))
+                    if tracker.obj_gs is not None:
+                        rr.log("world/object/gs", rr.Points3D(pts_O, colors=cols_rgb))
+                
+                pending_eval = None
+        else:
+            # ==========================================
+            # Evaluation Frame (Odd Index)
+            # ==========================================
+            # Buffer the frame and wait for the next tracking frame to complete
+            pending_eval = fd
+            print(f"Evaluation Frame {idx} buffered.")
 
     if ates: print(f"\n>>> Final Mean ATE: {np.mean(ates):.4f}m")
     if psnrs: print(f">>> Final Mean PSNR: {np.mean(psnrs):.2f}dB")
     if ssims: print(f">>> Final Mean SSIM: {np.mean(ssims):.4f}")
+    if lpipss: print(f">>> Final Mean LPIPS: {np.mean(lpipss):.4f}")
+    
+    if cfg.save_render and len(eval_frames) > 0:
+        video_path = Path(cfg.render_dir) / f"eval_render_{cfg.clip_id.replace('/', '_')}.mp4"
+        h, w = eval_frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(video_path), fourcc, 15.0, (w, h))
+        for frame in eval_frames:
+            out.write(frame)
+        out.release()
+        print(f"[Visualization] Saved concatenated evaluation video to {video_path}")
+        
     tracker.on_finish()
 
 def main():
