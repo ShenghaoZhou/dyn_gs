@@ -24,7 +24,7 @@ from run_multi_view_loss import compute_multi_view_loss
 # Import PGSR-style loss utilities
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "third_party" / "PGSR"))
-from utils.loss_utils import ssim, lncc, get_img_grad_weight
+from gs_dyn_obj.utils.ssim import ssim
 
 @dataclass
 class MappingConfig:
@@ -720,7 +720,7 @@ class GSMapping:
     def refine_pose(self, image_t, mask_t, cam, T_CO_init, steps=60):
         """Optimizes T_CO and scale to align the GS model with the current image using a pyramid approach."""
         import torch.optim as optim
-        from utils.loss_utils import ssim
+        from gs_dyn_obj.utils.ssim import ssim
         device = self.cfg.device
         
         def matrix_to_se3(T):

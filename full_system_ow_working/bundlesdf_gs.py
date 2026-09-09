@@ -25,9 +25,10 @@ from gs_dyn_obj.obj_gs import ObjectGS
 from gs_dyn_obj.gs_param import GSParam
 from gs_dyn_obj.gs_rendering import render_2dgs, render_3dgs
 from obj_gs_mapping import GSMapping, MappingConfig, MiniCam, gen_virtul_cam, compute_single_view_loss
-# Add PGSR to sys.path for ssim
-sys.path.append(str(Path(__file__).parent.parent / "third_party" / "PGSR"))
-from utils.loss_utils import ssim
+# NOTE: the old `from utils.loss_utils import ssim` here (plus a sys.path.append
+# for third_party/PGSR) was dead -- `ssim` is never used in this module and the
+# PGSR directory does not exist. Removed; loss_utils.py has never existed in the
+# repo, so importing it crashed startup. See gs_dyn_obj/utils/ssim.py for ssim.
 
 @dataclass
 class GeoTrackerConfig:
