@@ -11,6 +11,7 @@ import time
 import yaml
 import logging
 import random
+import queue
 from dataclasses import dataclass
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
@@ -55,14 +56,51 @@ class GeoTrackerConfig:
     use_occlusion_check: bool = False
     use_informed_filtering: bool = False
     informed_thresh: float = 50.0 # Relaxed pixels
-    monocular_scale_alignment: bool = True # Use RelPose to fix scale at start
+    # NOTE: not consumed by the tracker -- align_depth is what actually enables
+    # alignment. estimate_depth_alignment() corrects *per-frame* scale drift
+    # against already-tracked points; it cannot fix an unknown *absolute* scale,
+    # which would need an external reference (GT rel pose, GPS, ...) that this
+    # system does not have.
+    monocular_scale_alignment: bool = True
     align_depth: bool = False
     align_with_bias: bool = True
     
     gs_type: str = "2d" # "2d" or "3d"
     photometric_mode: str = "lm" # "hybrid", "adam", or "lm"
     use_match_projections: bool = False
+    # Snap the geometric tracker's track points onto optimized GS means after each
+    # mapping update. Set False to keep the two representations independent.
+    update_tracker_points_from_gs: bool = True
     debug: bool = False
+
+def prepare_gs_optimizer(mapper, cfg, device):
+    """Enable per-attribute grads, set up the optimizer, and build the densification kernel.
+
+    Shared by the synchronous and asynchronous mapper paths so their optimization
+    setup cannot drift apart.
+    """
+    params_to_enable = ["quats", "opacity"]
+    if cfg.use_ray_dist and mapper.gs_params.ray_dist is not None:
+        params_to_enable.append("ray_dist")
+    else:
+        params_to_enable.append("means")
+    if not cfg.fix_scale:
+        params_to_enable.append("scales")
+    if not cfg.fix_color:
+        params_to_enable.append("shs" if mapper.gs_params.shs is not None else "colors")
+    for attr in params_to_enable:
+        p = getattr(mapper.gs_params, attr)
+        if p is not None:
+            p.requires_grad_(True)
+
+    mapper.setup_optimizer()
+
+    radius = 3
+    disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=device)
+    ky, kx = torch.meshgrid(torch.arange(-radius, radius + 1), torch.arange(-radius, radius + 1), indexing="ij")
+    disc_kernel[0, 0, torch.sqrt(kx ** 2 + ky ** 2) <= radius + 0.5] = 1
+    mapper.disc_kernel = disc_kernel / disc_kernel.sum()
+
 
 class BundleSdfGS:
     def __init__(self, tracker_cfg: GeoTrackerConfig, cfg_mapping: MappingConfig, use_multiprocessing: bool = True, initial_gs: GSParam = None):
@@ -96,7 +134,6 @@ class BundleSdfGS:
         
         self.last_synced_frame = -1
         self.gs_ready = False
-        self.prev_gray = None
         self.mapping_process = None
         self.mapper = None
         
@@ -104,11 +141,37 @@ class BundleSdfGS:
         self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
         self.prev_gray = None
         self.prev_mask = None
+
+        # Surface config combinations that silently weaken the pipeline.
+        if tracker_cfg.monocular_scale_alignment and not tracker_cfg.align_depth:
+            logging.warning(
+                "[BundleSdfGS] monocular_scale_alignment=True but align_depth=False: "
+                "depth is NOT scale-aligned. Every meter-valued threshold here "
+                "(velocity cap, pose jump, PnP inliers) assumes metric depth."
+            )
+        if not (tracker_cfg.use_occlusion_check or tracker_cfg.use_informed_filtering):
+            logging.warning(
+                "[BundleSdfGS] use_occlusion_check and use_informed_filtering are both off: "
+                "geometric tracking is pure optical-flow projection + RANSAC PnP, "
+                "with no depth consistency check or track recovery."
+            )
         
     @property
     def mapper_last_finished_frame(self):
         return self.p_dict.get('last_finished_frame', -1)
-        
+
+    def _gs_points_in_tracker_frame(self):
+        """Return GS means in the frame the geometric tracker stores track points in.
+
+        GS means are in object space, but the tracker seeds its first points with
+        T_CiO = I (see run()), so its 'object' frame is really the frame-0 camera.
+        Comparing the two directly made the 5cm nearest-neighbour gate fail almost
+        entirely, so the GS -> tracker update never happened.
+        """
+        T_C0O = self.T_C0O_anchor if getattr(self, "T_C0O_anchor", None) is not None else self.poses.get(0, np.eye(4))
+        means_o = self.obj_gs.gs_params.means.detach().cpu().numpy()
+        return means_o @ T_C0O[:3, :3].T + T_C0O[:3, 3]
+
     def _update_gs_from_mapper(self):
         """Update tracker's GS model from mapper if available."""
         if self.p_dict.get('latest_gs') is not None:
@@ -132,8 +195,8 @@ class BundleSdfGS:
                             self.obj_gs.update_reference(img_ref, self.obj_gs.T_C_O_ref, alpha_ref)
                 
                 # Update geometric tracker's 3D points from the optimized GS means
-                new_points = self.obj_gs.gs_params.means.detach().cpu().numpy()
-                self.tracker.update_object_points(new_points)
+                if self.tracker_cfg.update_tracker_points_from_gs:
+                    self.tracker.update_object_points(self._gs_points_in_tracker_frame())
 
     def print_timings(self):
         print("\n" + "-"*30)
@@ -264,36 +327,9 @@ class BundleSdfGS:
         self.mapper.device = torch.device("cuda")
         self.mapper.gs_params.to(self.mapper.device)
         
-        # Enable grad for optimization
-        params_to_enable = ["quats", "opacity"]
-        if self.cfg_mapping.use_ray_dist and self.mapper.gs_params.ray_dist is not None:
-            params_to_enable.append("ray_dist")
-        else:
-            params_to_enable.append("means")
-            
-        if not self.cfg_mapping.fix_scale:
-            params_to_enable.append("scales")
-        if not self.cfg_mapping.fix_color:
-            if self.mapper.gs_params.shs is not None:
-                params_to_enable.append("shs")
-            else:
-                params_to_enable.append("colors")
-            
-        for attr in params_to_enable:
-            p = getattr(self.mapper.gs_params, attr)
-            if p is not None:
-                p.requires_grad_(True)
-
-        self.mapper.setup_optimizer()
+        prepare_gs_optimizer(self.mapper, self.cfg_mapping, self.mapper.device)
         self.mapper.keyframes = []
         self.mapping_frame_count = 0
-        
-        # Pre-compute disc kernel for densification
-        radius = 3
-        self.mapper.disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=self.mapper.device)
-        ky, kx = torch.meshgrid(torch.arange(-radius, radius + 1), torch.arange(-radius, radius + 1), indexing="ij")
-        self.mapper.disc_kernel[0, 0, torch.sqrt(kx**2 + ky**2) <= radius + 0.5] = 1
-        self.mapper.disc_kernel = self.mapper.disc_kernel / self.mapper.disc_kernel.sum()
         return True
 
     def render_current_view(self, K, W, H, T_CiO=None):
@@ -323,6 +359,37 @@ class BundleSdfGS:
                 T_CiO_torch, K_torch, W, H, shs=self.obj_gs.gs_params.shs
             )
         return (img, alpha)
+
+    def _enqueue_keyframe(self, kf_data):
+        """Hand a keyframe to the mapper without ever blocking the tracker.
+
+        The tracker is the real-time path, so it must never stall on the mapper.
+        When the queue is full we evict the oldest pending keyframe and keep the
+        newest -- the mapper only processes the last drained frame anyway.
+        """
+        if not self.use_multiprocessing:
+            self.run_mapping_step_sync(kf_data)
+            return
+
+        try:
+            self.kf_queue.put(kf_data, block=False)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            dropped = self.kf_queue.get_nowait()
+            logging.warning(
+                f"[BundleSdfGS] Mapper queue full; dropped keyframe "
+                f"{dropped.get('frame_idx')} to accept keyframe {kf_data['frame_idx']}"
+            )
+        except queue.Empty:
+            pass
+
+        try:
+            self.kf_queue.put(kf_data, block=False)
+        except queue.Full:
+            logging.warning(f"[BundleSdfGS] Dropped keyframe {kf_data['frame_idx']} (mapper too slow)")
 
     def run(self, color, mask, depth, K, T_CW=None, T_WO_init=None, return_render=False):
         """
@@ -361,7 +428,6 @@ class BundleSdfGS:
                 self.prev_gray = curr_gray
                 return self.poses.get(self.cnt-1, np.eye(4)), None
                 
-            curr_gray = cv2.cvtColor(color, cv2.COLOR_RGB2GRAY)
             flow = self.dis.calc(self.prev_gray, curr_gray, None)
             self.prev_gray = curr_gray
             self.timings["Pre-processing (Flow)"].append(time.perf_counter() - t0)
@@ -453,14 +519,15 @@ class BundleSdfGS:
                 T_guess_new = T_CiO_refined @ np.linalg.inv(self.poses[0])
 
                 
-                diff_t = np.linalg.norm(T_guess_new[:3, 3] - T_guess_rel[:3, 3])
                 # Safety check: reject if photometric refinement moved too much
                 diff_t = np.linalg.norm(T_guess_new[:3, 3] - T_guess_rel[:3, 3])
                 diff_R = np.rad2deg(np.arccos(np.clip((np.trace(T_guess_new[:3, :3] @ T_guess_rel[:3, :3].T) - 1) / 2, -1, 1)))
                 
                 if diff_t > 0.5 or diff_R > 20.0:
-                    # Silent rejection
-                    pass
+                    logging.info(
+                        f"[BundleSdfGS] Rejecting photometric refinement "
+                        f"({diff_t:.4f}m, {diff_R:.2f}deg > 0.5m / 20deg); keeping geometric guess"
+                    )
                 else:
                     print(f"[BundleSdfGS] Photometric refinement adjusted guess: {diff_t:.6f}m, {diff_R:.6f}deg")
                     T_guess_rel = T_guess_new
@@ -478,15 +545,18 @@ class BundleSdfGS:
             jump = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
             # Relaxed jump threshold if inliers are high
             max_jump = 1.0 if n_inliers < 50 else 2.0
-            if not success or n_inliers < self.tracker_cfg.min_pnp_inliers or jump > max_jump:
-                if success and jump > max_jump:
-                    print(f"[GeoTracker] Rejecting PnP (jump: {jump:.4f}m > {max_jump}m)")
-                # If PnP failed, we use the guess but DON'T add points yet as the pose is suspect
-                if not success:
-                    self.poses[self.cnt] = T_guess
-                    self.tracker.poses[self.cnt] = T_guess
-                else:
-                    self.poses[self.cnt] = self.tracker.poses[self.cnt]
+            pnp_rejected = (not success) or (n_inliers < self.tracker_cfg.min_pnp_inliers) or (jump > max_jump)
+            if pnp_rejected:
+                logging.info(
+                    f"[BundleSdfGS] Rejecting PnP (inliers={n_inliers}, jump={jump:.4f}m "
+                    f"> max_jump={max_jump}m); falling back to velocity guess"
+                )
+                # step_informed_with_occlusion stores the rejected pose in tracker.poses,
+                # so write the guess back explicitly -- reading tracker.poses[cnt] here
+                # would silently re-accept the pose we just rejected.
+                self.tracker.poses[self.cnt] = T_guess
+                self.poses[self.cnt] = T_guess
+                # DON'T add points yet as the pose is suspect
             else:
                 self.poses[self.cnt] = self.tracker.poses[self.cnt]
                 # If we are low on points AND PnP was successful, add more
@@ -538,7 +608,6 @@ class BundleSdfGS:
             self.tracker.keyframes.append(self.cnt)
             # Update tracker with new points
             # If GS is ready, use optimized GS depth but ONLY for high-confidence regions
-            curr_depth = depth
             # Robustly use only monocular depth for points to avoid GS reconstruction noise
             curr_depth = depth
             
@@ -550,10 +619,7 @@ class BundleSdfGS:
             
             # Update mapper with object-centric pose
             kf_data = {"frame_idx": self.cnt, "image": color, "mask": mask, "depth": depth, "K": K, "T_CiO": T_CiO}
-            if self.use_multiprocessing:
-                self.kf_queue.put(kf_data)
-            else:
-                self.run_mapping_step_sync(kf_data)
+            self._enqueue_keyframe(kf_data)
         
         self.timings["Total run()"].append(time.perf_counter() - t_start)
         self.prev_mask = mask.copy()
@@ -570,10 +636,7 @@ class BundleSdfGS:
             "T_CiO": T_CiO,
             "force_densify": True
         }
-        if self.use_multiprocessing:
-            self.kf_queue.put(kf_data)
-        else:
-            self.run_mapping_step_sync(kf_data)
+        self._enqueue_keyframe(kf_data)
 
     def run_mapping_step_sync(self, frame_data):
         """Synchronous mapping step."""
@@ -597,8 +660,8 @@ class BundleSdfGS:
                     self.obj_gs.update_reference(img_ref, self.obj_gs.T_C_O_ref, alpha_ref)
             
             # Update geometric tracker's 3D points
-            new_points = self.obj_gs.gs_params.means.detach().cpu().numpy()
-            self.tracker.update_object_points(new_points)
+            if self.tracker_cfg.update_tracker_points_from_gs:
+                self.tracker.update_object_points(self._gs_points_in_tracker_frame())
 
     def run_ba_python(self):
         if len(self.keyframes) < 2: return
@@ -630,33 +693,7 @@ def run_gs_mapping_process(cfg, initial_gs, kf_queue, p_dict, stop_event):
     mapper.gs_params.to(mapper.device)
     
     # Re-enable grad for optimization in this process based on config
-    params_to_enable = ["quats", "opacity"]
-    if cfg.use_ray_dist and mapper.gs_params.ray_dist is not None:
-        params_to_enable.append("ray_dist")
-    else:
-        params_to_enable.append("means")
-        
-    if not cfg.fix_scale:
-        params_to_enable.append("scales")
-    if not cfg.fix_color:
-        if mapper.gs_params.shs is not None:
-            params_to_enable.append("shs")
-        else:
-            params_to_enable.append("colors")
-        
-    for attr in params_to_enable:
-        p = getattr(mapper.gs_params, attr)
-        if p is not None:
-            p.requires_grad_(True)
-            
-    mapper.setup_optimizer()
-    
-    # Pre-compute disc kernel for densification
-    radius = 3
-    mapper.disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=mapper.device)
-    ky, kx = torch.meshgrid(torch.arange(-radius, radius + 1), torch.arange(-radius, radius + 1), indexing="ij")
-    mapper.disc_kernel[0, 0, torch.sqrt(kx**2 + ky**2) <= radius + 0.5] = 1
-    mapper.disc_kernel = mapper.disc_kernel / mapper.disc_kernel.sum()
+    prepare_gs_optimizer(mapper, cfg, mapper.device)
     
     frame_count = 0
     while not stop_event.is_set():

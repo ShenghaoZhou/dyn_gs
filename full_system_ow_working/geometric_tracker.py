@@ -6,6 +6,7 @@ import pycolmap
 import pycolmap.cost_functions
 from scipy.spatial.transform import Rotation as R
 from dataclasses import dataclass
+import logging
 
 @dataclass
 class GeoTrackerConfig:
@@ -263,6 +264,20 @@ class GeometricTracker:
         self.last_scale = 1.0
         self.triangulated_tids = set()
 
+        # Report flags that reduce this to plain flow projection + PnP, so a
+        # silently-weakened tracker is visible in the logs.
+        _optional = {
+            "use_occlusion_check": "depth occlusion rejection",
+            "use_informed_filtering": "reprojection-consistency filtering",
+            "use_match_projections": "lost-track recovery",
+        }
+        _off = [label for key, label in _optional.items() if not getattr(cfg, key, False)]
+        if _off:
+            logging.warning(
+                f"[GeometricTracker] Disabled: {', '.join(_off)}. "
+                "Tracking is plain optical-flow projection + RANSAC PnP."
+            )
+
     def estimate_depth_alignment(self, frame_idx, depth, mask, K):
         """
         Estimate scale (s) and bias (b) such that d_ref = s * d_obs + b.
@@ -458,7 +473,7 @@ class GeometricTracker:
         if summary.final_cost < summary.initial_cost:
             track['pt3d'] = pt3d
     
-    def refine_pose(self, frame_idx, K, tids_pnp=None, inlier_mask=None):
+    def refine_pose(self, frame_idx, K, tids_pnp=None, inlier_mask=None, W=1280, H=720):
         pts2d, pts3d = [], []
         if tids_pnp is not None and inlier_mask is not None:
             for i in range(len(tids_pnp)):
@@ -473,7 +488,7 @@ class GeometricTracker:
                     pts3d.append(t['pt3d'])
 
         T = self.poses[frame_idx].copy()
-        cam_dict = {"model": "PINHOLE", "width": 1280, "height": 720, "params": [K[0,0], K[1,1], K[0,2], K[1,2]]}
+        cam_dict = {"model": "PINHOLE", "width": W, "height": H, "params": [K[0,0], K[1,1], K[0,2], K[1,2]]}
         
         # Use poselib's built-in refinement
         pose_in = poselib.CameraPose()
@@ -516,7 +531,7 @@ class GeometricTracker:
                         continue
                         
                     # Informed filtering: if T_guess is available, check if flow matches projection
-                    if T_guess_curr is not None and getattr(self.cfg, "use_informed_filtering", True):
+                    if T_guess_curr is not None and getattr(self.cfg, "use_informed_filtering", False):
                         p_O = t['pt3d']
                         p_Ci = T_guess_curr[:3, :3] @ p_O + T_guess_curr[:3, 3]
                         if p_Ci[2] > 0.01:
@@ -676,13 +691,13 @@ class GeometricTracker:
                     p_Ci = T_guess[:3, :3] @ p_O + T_guess[:3, 3]
                     if p_Ci[2] > 0.01:
                         # Depth Consistency
-                        if depth is not None and getattr(self.cfg, "use_occlusion_check", True):
+                        if depth is not None and getattr(self.cfg, "use_occlusion_check", False):
                             d_obs = depth[iy, ix]
                             if d_obs > 0.01 and d_obs < p_Ci[2] - getattr(self.cfg, "occlusion_margin", 0.05):
                                 continue # Occluded by something closer
                         
                         # Flow consistency with guess
-                        if getattr(self.cfg, "use_informed_filtering", True):
+                        if getattr(self.cfg, "use_informed_filtering", False):
                             uv_proj_hom = K @ p_Ci
                             uv_proj = uv_proj_hom[:2] / uv_proj_hom[2]
                             dist = np.linalg.norm(uv_curr - uv_proj)
@@ -692,7 +707,7 @@ class GeometricTracker:
                     t['obs'][frame_idx] = uv_curr
         
         # 3. Match Projections (Recover lost tracks)
-        if getattr(self.cfg, "use_match_projections", True):
+        if getattr(self.cfg, "use_match_projections", False):
             self.match_projections(frame_idx, image, mask, K, T_guess)
         
         pts2d, pts3d, tids = [], [], []
@@ -702,7 +717,7 @@ class GeometricTracker:
                 pts3d.append(t['pt3d'])
                 tids.append(tid)
         
-        if len(pts2d) < getattr(self.cfg, "min_pnp_inliers", 15):
+        if len(pts2d) < getattr(self.cfg, "min_pnp_inliers", 20):
             print(f"[GeoTracker] Insufficient tracks at frame {frame_idx} (found {len(pts2d)})")
             self.poses[frame_idx] = T_guess.copy()
             return False, 0
@@ -756,7 +771,7 @@ class GeometricTracker:
                         print(f"[GeoTracker] Rejecting PnP (jump: {diff_t:.4f}m > {getattr(self.cfg, 'max_pose_jump', 0.1)}m)")
                         T = T_guess.copy()
                         n_inliers = n_inliers_guess
-                    elif n_inliers < getattr(self.cfg, "min_pnp_inliers", 15):
+                    elif n_inliers < getattr(self.cfg, "min_pnp_inliers", 20):
                         print(f"[GeoTracker] Rejecting PnP (inliers: {n_inliers} < {getattr(self.cfg, 'min_pnp_inliers', 15)})")
                         T = T_guess.copy()
                         n_inliers = n_inliers_guess
@@ -770,7 +785,7 @@ class GeometricTracker:
         
         if getattr(self.cfg, "do_refine", True) and not skip_pnp:
             inliers = info.get('inliers') if info is not None else None
-            self.refine_pose(frame_idx, K, tids_pnp=tids, inlier_mask=inliers)
+            self.refine_pose(frame_idx, K, tids_pnp=tids, inlier_mask=inliers, W=image.shape[1], H=image.shape[0])
             
         return True, n_inliers
 
