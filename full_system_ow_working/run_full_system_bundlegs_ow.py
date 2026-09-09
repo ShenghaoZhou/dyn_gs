@@ -54,6 +54,14 @@ class GlobalConfig:
     clip_id: str = "clip-003312"
     device: str = "cuda"
     num_frames: int = 150
+    # Which depth buffer to feed the tracker and mapper. This single choice sets
+    # the ABSOLUTE SCALE of everything downstream: tracker 3D tracks, GS means,
+    # GS scales (obj_gs_mapping densify scales Gaussians by z) and ray_dist are
+    # all lifted from this buffer, so none of them can know its own scale.
+    # "model_infer" is the pipeline's original non-metric source. DA3METRIC is
+    # metric but currently regresses over long runs. See DEPTH_SOURCES below for
+    # the measured numbers.
+    depth_source: str = "model_infer"
     init_frame: int = 0
     n_features: int = 2000
     feature_type: Literal["orb", "gftt", "grid"] = "grid"
@@ -128,7 +136,64 @@ class GlobalConfig:
     multiprocess_dyn: bool = False # Default to False as in test_hot3d.py
     use_pgsr: bool = False
 
-def load_frame_data_v2(data_dir, frame_idx):
+# Depth buffers available on disk for a clip, by short name. Only the
+# chosen one is actually loaded; every other source below shares the same
+# loader plumbing. "model_infer" is the pipeline's historical default and is
+# the one the reported baselines were produced with.
+#
+# Measured on clip-003312 (Umeyama s vs GT, metric == 1.0):
+#   model_infer  s=0.35 @30f, 0.94-1.12 @150f   <- non-metric, unstable
+#   DA3METRIC    s=1.04 @30f, 0.44 @150f        <- metric at short range
+#   moge         s=1.25 @30f
+# DA3METRIC is the genuinely metric source and cut 30-frame raw ATE 0.1715 ->
+# 0.0290 m, but over 150 frames it REGRESSES to 0.6591 m (vs 0.1896-0.3998 for
+# model_infer) because the GS mapper collapses around frame 25: mask loss rises
+# 0.001 -> 0.187 and PnP inliers drop to 0, so the pose is frozen at the
+# velocity guess. That mapper failure is separate from scale, so the default
+# stays model_infer -- keep this default until the frame-25 collapse is fixed.
+#
+# The pipeline is also stochastic: two 150-frame runs on the identical
+# model_infer path gave 0.1896 m and 0.3998 m mean ATE (Umeyama s 0.94 and
+# 1.12). Single-run ATE deltas below ~2x are noise.
+DEPTH_SOURCES = {
+    "model_infer":    ("model_infer",          "depth_{i:05d}.npy"),
+    "dyn_obj_masked": ("dyn_obj_masked_infer", "depth_{i:05d}.npy"),
+    "DA3METRIC":      ("depth_cache/DA3METRIC-LARGE", "{i:06d}.npy"),
+    "DA3-LARGE":      ("depth_cache/DA3-LARGE-1.1",   "{i:06d}.npy"),
+    "DA3-BASE":       ("depth_cache/DA3-BASE",        "{i:06d}.npy"),
+    "moge":           ("moge_depth",               "{i:06d}.npy"),
+    "depth_static":   ("depth_static",             "{i:06d}.npy"),
+    "depth_dyn":      ("depth_dyn",                "{i:06d}.npy"),
+    "depth":          ("depth",                    "{i:06d}.npy"),
+}
+
+
+def resolve_depth_path(data_dir, frame_idx, source):
+    """Resolve the depth file for (source, frame_idx).
+
+    Falls back through model_infer -> dyn_obj_masked_infer -> depth so a
+    single missing frame in a third-party cache does not kill the run.
+    Returns None when nothing is available.
+    """
+    if source not in DEPTH_SOURCES:
+        print(f"[depth] unknown depth_source={source!r}, falling back to model_infer. "
+              f"Known: {sorted(DEPTH_SOURCES)}")
+        source = "model_infer"
+    rel, tmpl = DEPTH_SOURCES[source]
+    path = data_dir / rel / tmpl.format(i=frame_idx)
+    if path.exists():
+        return path
+    for fb in ("model_infer", "dyn_obj_masked_infer", "depth"):
+        if fb == source:
+            continue
+        rel_fb, tmpl_fb = DEPTH_SOURCES[fb]
+        p = data_dir / rel_fb / tmpl_fb.format(i=frame_idx)
+        if p.exists():
+            return p
+    return None
+
+
+def load_frame_data_v2(data_dir, frame_idx, depth_source="model_infer"):
     import cv2
     import numpy as np
     from scipy.spatial.transform import Rotation as R
@@ -144,12 +209,10 @@ def load_frame_data_v2(data_dir, frame_idx):
     if not mask_path.exists():
         mask_path = data_dir / "obj_masks" / f"{frame_idx:06d}.png"
     
-    # Search for depth
-    depth_path = data_dir / "model_infer" / f"depth_{frame_idx:05d}.npy"
-    if not depth_path.exists():
-        depth_path = data_dir / "dyn_obj_masked_infer" / f"depth_{frame_idx:05d}.npy"
-    if not depth_path.exists():
-        depth_path = data_dir / "depth" / f"{frame_idx:06d}.npy"
+    # Depth: this buffer's units are the absolute scale of the entire pipeline
+    # (tracker tracks, GS means, GS scales, ray_dist). Selectable via
+    # cfg.depth_source; see DEPTH_SOURCES.
+    depth_path = resolve_depth_path(data_dir, frame_idx, depth_source)
     
     k_path = data_dir / "intrinsics" / f"{frame_idx:06d}.npy"
     extrin_path = data_dir / "extrinsics" / f"{frame_idx:06d}.npy"
@@ -199,7 +262,7 @@ def data_loader_worker(cfg, static_q, dynamic_q):
     count = 0
     for i in range(cfg.num_frames):
         idx = cfg.init_frame + i
-        fd = load_frame_data_v2(data_dir, idx)
+        fd = load_frame_data_v2(data_dir, idx, cfg.depth_source)
         if fd is None: 
             print(f"[Data Loader] Frame {idx} not found, stopping.")
             break
@@ -289,6 +352,10 @@ def umeyama(src, dst):
 def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
     print(f"[Dynamic Worker] Starting on {cfg.device}")
     device = torch.device(cfg.device)
+    # Record which depth buffer this run used: it fixes the absolute scale of
+    # the entire trajectory, so two runs differing only in depth_source are
+    # measuring different units and their ATEs are not comparable.
+    print(f"[Dynamic Worker] depth_source={cfg.depth_source}")
     
     # Initialize Tracker and Mapping configs for BundleSdfGS
     tracker_cfg = GeoTrackerConfig(
@@ -536,11 +603,28 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
             est_p = np.stack([traj_est[i][:3, 3] for i in valid])
             gt_p = np.stack([traj_gt[i][:3, 3] for i in valid])
             s, Rot, tr = umeyama(est_p, gt_p)
+
+            # Scale-only alignment: uniform scale + centroid translation, no
+            # rotation. This is the metric the depth buffer's absolute scale
+            # directly controls, so a gap between this and the full Umeyama
+            # RMSE is rotation/drift, not scale.
+            est_sc = est_p * s
+            scale_aligned = est_sc - est_sc.mean(0) + gt_p.mean(0)
+            err_sc = np.linalg.norm(scale_aligned - gt_p, axis=1)
+
+            # Full Umeyama: scale + rotation + translation.
             aligned = (est_p * s) @ Rot.T + tr
             err = np.linalg.norm(aligned - gt_p, axis=1)
-            print(f">>> Raw:          Mean={np.mean(ates):.4f}m, Max={np.max(ates):.4f}m")
-            print(f">>> PnP rejections: {tracker.pnp_rejections}/{len(ates)} frames")
-            print(f">>> Umeyama-aligned (s={s:.4f}): RMSE={np.sqrt(np.mean(err ** 2)):.4f}m, Max={err.max():.4f}m")
+
+            print(f">>> Raw:                Mean={np.mean(ates):.4f}m, Max={np.max(ates):.4f}m")
+            print(f">>> PnP rejections:     {tracker.pnp_rejections}/{len(ates)} frames")
+            print(f">>> Scale-aligned (s={s:.4f}):        RMSE={np.sqrt(np.mean(err_sc ** 2)):.4f}m, Max={err_sc.max():.4f}m")
+            print(f">>> Umeyama-aligned (s={s:.4f}):      RMSE={np.sqrt(np.mean(err ** 2)):.4f}m, Max={err.max():.4f}m")
+            if np.isclose(s, 1.0, atol=1e-3):
+                print(f">>> Scale is metric: the depth buffer's units are meters (s=1.0).")
+            else:
+                print(f">>> Depth buffer scale error: {100*(s-1.0):+.1f}% vs GT "
+                      f"(s={s:.4f}; metric depth would give 1.0).")
         if cfg.traj_dump:
             dump_path = Path(cfg.traj_dump)
             dump_path.parent.mkdir(parents=True, exist_ok=True)
