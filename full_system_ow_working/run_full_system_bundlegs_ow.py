@@ -59,7 +59,12 @@ class GlobalConfig:
     feature_type: Literal["orb", "gftt", "grid"] = "grid"
     ransac_thresh: float = 1.0
     informed_thresh: float = 50.0
-    max_pose_jump: float = 1.0
+    # Max pose jump vs the predicted guess, in meters. 1.0 m was ~220x the GT
+    # per-frame motion on this clip (median 4.6 mm, max 22 mm), so the rejection
+    # gate never fired and drift accumulated unopposed. 0.05 m is ~2x GT max.
+    # BundleSdfGS._jump_limit() widens this adaptively from observed accepted
+    # motion, so real fast motion is still allowed through.
+    max_pose_jump: float = 0.05
     num_opt_steps: int = 50
     mask_loss_weight: float = 20.0
     pyr_levels: int = 2
@@ -69,6 +74,10 @@ class GlobalConfig:
     rerun_url: str = "rerun+http://128.175.109.248:9876/proxy"
     serve: bool = False
     no_vis: bool = False
+    # Where to dump per-frame T_CiO estimate + GT. Empty string disables it.
+    # The raw mean ATE does not say whether the error is one outlier or a broad
+    # offset, so the matrices are written out for offline inspection.
+    traj_dump: str = "renders/trajectory_est_gt.npz"
     debug: bool = False
     separate_render: bool = True
     use_alpha_blending: bool = True
@@ -95,8 +104,13 @@ class GlobalConfig:
     min_kf_rot: float = 5.0
     kf_overlap_thresh: float = 0.8
     min_kf_interval: int = 3
-    max_photo_jump_t: float = 0.5
-    max_photo_jump_R: float = 20.0
+    # Photometric-refinement gate. These were previously declared here and never
+    # read -- the comparison in BundleSdfGS.step() was hardcoded to 0.5 m / 20
+    # deg. They now reach the tracker config and act as floors for the adaptive
+    # limit. Calibrated against GT per-frame motion: translation 22 mm max,
+    # rotation 2.04 deg max (the run was producing 36-60 deg steps).
+    max_photo_jump_t: float = 0.05
+    max_photo_jump_R: float = 3.0
     fix_color: bool = True
     fix_scale: bool = True
     use_ray_dist: bool = True
@@ -248,6 +262,30 @@ def static_scene_worker(cfg, bg_queue, data_q):
                 xyz = scene_model.xyz.detach().cpu().numpy(); colors = scene_model.colors.detach().cpu().numpy().squeeze()
                 if len(xyz) > 0: rr.log("static/gs_points", rr.Points3D(xyz, colors=colors))
 
+def umeyama(src, dst):
+    """Estimate the optimal similarity transform (s, R, t) mapping src -> dst.
+
+    src, dst: (N, 3) point arrays. Returns scale s, rotation R and translation t
+    such that dst ~= s * (R @ src.T).T + t. Used to separate a constant offset or
+    scale error from genuine drift: if the aligned error is much smaller than the
+    raw error, the estimate is a rigid-ish translation of the truth rather than
+    diverging.
+    """
+    n = src.shape[0]
+    mu_s, mu_d = src.mean(axis=0), dst.mean(axis=0)
+    z_s, z_d = src - mu_s, dst - mu_d
+    cov = z_d.T @ z_s / n
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:   # reject reflection
+        S[-1, -1] = -1
+    R = U @ S @ Vt
+    var_s = np.mean(np.sum(z_s ** 2, axis=1))
+    s = float(np.trace(np.diag(D) @ S) / var_s) if var_s > 0 else 1.0
+    t = mu_d - s * (R @ mu_s)
+    return s, R, t
+
+
 def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
     print(f"[Dynamic Worker] Starting on {cfg.device}")
     device = torch.device(cfg.device)
@@ -260,6 +298,8 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         photometric_mode=cfg.photometric_mode,
         n_init_frames=cfg.n_init_frames,
         max_pose_jump=cfg.max_pose_jump,
+        max_photo_jump_t=cfg.max_photo_jump_t,
+        max_photo_jump_R=cfg.max_photo_jump_R,
         informed_thresh=cfg.informed_thresh,
         ransac_thresh=cfg.ransac_thresh,
         grid_spacing=cfg.grid_spacing,
@@ -345,6 +385,8 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
     tracker = BundleSdfGS(tracker_cfg, map_cfg, use_multiprocessing=cfg.multiprocess_dyn, initial_gs=initial_gs)
     
     ates = []
+    # Full T_CiO matrices (estimate and GT) for offline trajectory inspection.
+    traj_est, traj_gt = [], []
     last_static_gs_data = None
     traj_obj_est_C, traj_obj_gt_C = [], []
     
@@ -433,6 +475,8 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         # Metrics and Logging
         ate = np.linalg.norm(T_CO_est[:3, 3] - T_CO_gt[:3, 3]) if T_CO_gt is not None else 0.0
         ates.append(ate)
+        traj_est.append(T_CO_est)
+        traj_gt.append(T_CO_gt)
         target_image = torch.from_numpy(fd["image"]).float().to(device).permute(2, 0, 1) / 255.0
         psnr = -10.0 * torch.log10(torch.mean((img_render - target_image)**2) + 1e-10)
         
@@ -485,7 +529,29 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
             T_WO_est = np.linalg.inv(fd["extrin"]) @ T_CO_est
             rr.log("world/object", rr.Transform3D(mat3x3=T_WO_est[:3, :3], translation=T_WO_est[:3, 3]))
 
-    if ates: print(f"\n>>> Final Mean ATE: {np.mean(ates):.4f}m")
+    if ates:
+        print(f"\n>>> Final Mean ATE (raw, unaligned): {np.mean(ates):.4f}m")
+        valid = [i for i, p in enumerate(traj_gt) if p is not None]
+        if len(valid) >= 3:
+            est_p = np.stack([traj_est[i][:3, 3] for i in valid])
+            gt_p = np.stack([traj_gt[i][:3, 3] for i in valid])
+            s, Rot, tr = umeyama(est_p, gt_p)
+            aligned = (est_p * s) @ Rot.T + tr
+            err = np.linalg.norm(aligned - gt_p, axis=1)
+            print(f">>> Raw:          Mean={np.mean(ates):.4f}m, Max={np.max(ates):.4f}m")
+            print(f">>> PnP rejections: {tracker.pnp_rejections}/{len(ates)} frames")
+            print(f">>> Umeyama-aligned (s={s:.4f}): RMSE={np.sqrt(np.mean(err ** 2)):.4f}m, Max={err.max():.4f}m")
+        if cfg.traj_dump:
+            dump_path = Path(cfg.traj_dump)
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                str(dump_path),
+                T_CO_est=np.stack(traj_est) if traj_est else np.zeros((0, 4, 4)),
+                T_CO_gt=np.array([p if p is not None else np.eye(4) for p in traj_gt]) if traj_gt else np.zeros((0, 4, 4)),
+                valid_gt=np.array([p is not None for p in traj_gt], dtype=bool),
+                ate=np.array(ates),
+            )
+            print(f">>> Trajectory dumped to {dump_path}")
     tracker.on_finish()
 
 def main():

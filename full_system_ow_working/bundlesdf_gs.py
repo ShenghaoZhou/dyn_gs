@@ -12,7 +12,7 @@ import yaml
 import logging
 import random
 import queue
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 from collections import defaultdict
@@ -35,7 +35,22 @@ class GeoTrackerConfig:
     feature_type: str = "orb" # "loftr", "superpoint", "orb", "grid"
     n_features: int = 2000 # Increased for better robustness
     min_pnp_inliers: int = 20
-    max_pose_jump: float = 10.0 # Effectively disable rejection to match benchmark
+    # Max |pose jump| of PnP vs the predicted guess, in meters.
+    # The original value was 10.0 with the comment "Effectively disable rejection
+    # to match benchmark" -- i.e. rejection had been deliberately switched off.
+    # That meant every PnP estimate was stored as truth and then reused as the
+    # next frame's velocity, so one bad estimate poisoned every later frame.
+    # 0.05 m is ~2x the GT per-frame motion on this clip (median 4.6 mm, max
+    # 22 mm) and ~40x smaller than the 1.2-1.9 m jumps the tracker actually
+    # produced. BundleSdfGS also widens this adaptively from observed accepted
+    # motion (see _jump_limit).
+    max_pose_jump: float = 0.05
+    # Translation / rotation limits for the photometric-refinement gate. These
+    # used to live only in GlobalConfig and were never read -- the comparison in
+    # step() was hardcoded to 0.5 m / 20.0 deg. They are now the floors for the
+    # adaptive limits returned by _jump_limit().
+    max_photo_jump_t: float = 0.05
+    max_photo_jump_R: float = 3.0
     use_photometric_refinement: bool = True
     n_init_frames: int = 10 # Number of frames for photometric initialization
     
@@ -110,7 +125,12 @@ class BundleSdfGS:
         self.use_multiprocessing = use_multiprocessing
         self.initial_gs_param = initial_gs
         
-        self.tracker = GeometricTracker(tracker_cfg)
+        # Give the tracker its own copy of the config. step() mutates
+        # tracker.cfg.max_pose_jump every frame to apply the adaptive jump limit
+        # (_jump_limit). If the tracker shared the declarative tracker_cfg, that
+        # mutation would leak back and ratchet the floor upward frame over frame,
+        # silently disabling rejection again.
+        self.tracker = GeometricTracker(replace(tracker_cfg))
         # Ensure tracker's internal cfg has the flags
         self.tracker.cfg.use_occlusion_check = tracker_cfg.use_occlusion_check
         self.tracker.cfg.use_informed_filtering = tracker_cfg.use_informed_filtering
@@ -120,6 +140,23 @@ class BundleSdfGS:
         self.keyframes = []
         self.keyframes_data = [] # To store fd for evaluation # Indices of keyframes
         self.poses = {} # Combined poses (C0-from-Ci)
+
+        # Frame indices whose PnP estimate was actually ACCEPTED, plus the
+        # translation magnitude of each accepted step. Velocity prediction and
+        # the pose-jump limit are derived from these only.
+        #
+        # Rationale: the tracker is fully autoregressive. T_prev_rel is the most
+        # recently STORED pose, and a rejected frame writes the biased guess back
+        # as if it were measured (see the rejection branch below). With the
+        # baseline velocity cap of 0.5 m/frame, drift of ~0.024 m/frame accumulated
+        # undetected for 100+ frames because it never approached the 1.0 m
+        # rejection threshold, and each step was then fed forward as "truth".
+        # Restricting both the velocity and the limit to accepted frames breaks
+        # that loop: a rejected frame freezes the estimate instead of amplifying it.
+        self.accepted_rel = [] # frame indices whose PnP estimate was accepted
+        self.accepted_step_t = []
+        self.accepted_step_r = []
+        self.pnp_rejections = 0
         
         # Shared state for mapper
         self.kf_queue = multiprocessing.Queue(maxsize=10)
@@ -157,6 +194,27 @@ class BundleSdfGS:
                 "with no depth consistency check or track recovery."
             )
         
+    def _jump_limit(self):
+        """Adaptive pose-jump limits from observed ACCEPTED inter-frame motion.
+
+        Returns (max_t_m, max_r_deg). The config values are FLOORS, not caps:
+        observed real motion may widen the limit, but never shrink it below the
+        operator-chosen threshold.
+
+        The multipliers are chosen against GT for this clip: per-frame translation
+        is 4.6 mm median / 22 mm max, so 8x the median (3.7 cm) clears the fastest
+        real frame while staying 30x+ below the 1.2-1.9 m jumps the pipeline was
+        producing. Rotation is 0.60 deg median / 2.04 deg max, so 3x the median
+        with a 3 deg floor.
+        """
+        floor_t = max(self.tracker_cfg.max_pose_jump, self.tracker_cfg.max_photo_jump_t)
+        floor_r = self.tracker_cfg.max_photo_jump_R
+        st = self.accepted_step_t[-50:]
+        sr = self.accepted_step_r[-50:]
+        med_t = float(np.median(st)) if st else 0.01
+        med_r = float(np.median(sr)) if sr else 0.5
+        return max(floor_t, 8.0 * med_t), max(floor_r, 3.0 * med_r)
+
     @property
     def mapper_last_finished_frame(self):
         return self.p_dict.get('last_finished_frame', -1)
@@ -433,22 +491,42 @@ class BundleSdfGS:
             self.prev_gray = curr_gray
             self.timings["Pre-processing (Flow)"].append(time.perf_counter() - t0)
 
-            if self.cnt > 1:
-                T_pprev_rel = self.tracker.poses[self.cnt-2]
-                T_prev_rel = self.tracker.poses[self.cnt-1]
+            if len(self.accepted_rel) >= 2:
+                # Velocity from the two most recent ACCEPTED frames, not the two
+                # most recently STORED ones. A rejected frame stores its biased
+                # guess as if it were a measurement, so the old indexing
+                # (poses[cnt-1] / poses[cnt-2]) folded that bias into V and then
+                # re-used it as the next frame's prior -- the autoregressive
+                # amplification behind the frame-130 blowup.
+                a_prev, a_pprev = self.accepted_rel[-1], self.accepted_rel[-2]
+                T_prev_rel = self.tracker.poses[a_prev]
+                T_pprev_rel = self.tracker.poses[a_pprev]
                 V = T_prev_rel @ np.linalg.inv(T_pprev_rel)
-                
-                # Cap velocity: if rotation > 20 deg or translation > 0.5m, damp it
+
+                # Report only. The old code halved the step and then kept using
+                # it anyway, which still forwarded the bad estimate.
                 v_t = np.linalg.norm(V[:3, 3])
                 v_R = np.rad2deg(np.arccos(np.clip((np.trace(V[:3, :3]) - 1) / 2, -1, 1)))
                 if v_t > 0.5 or v_R > 20.0:
-                    print(f"[BundleSdfGS] High velocity detected: {v_t:.4f}m, {v_R:.2f}deg. Damping velocity.")
-                    V[:3, 3] *= 0.5
-                    V[:3, :3] = R.from_rotvec(R.from_matrix(V[:3, :3]).as_rotvec() * 0.5).as_matrix()
-                
+                    print(f"[BundleSdfGS] Unusual accepted-step velocity: {v_t:.4f}m, {v_R:.2f}deg")
+
                 T_guess_rel = V @ T_prev_rel
             else:
-                T_guess_rel = self.tracker.poses[self.cnt-1].copy()
+                # Not enough accepted evidence to extrapolate: predict no motion
+                # rather than inventing one. Matches the old behaviour for the
+                # first frames, where poses[0] is the identity anchor.
+                T_guess_rel = np.eye(4)
+
+            # One motion-adaptive limit, applied to both rejection gates below and
+            # to the tracker's internal PnP gate (assigned before the call).
+            # Setting self.tracker.cfg is sufficient: geometric_tracker reads it
+            # with getattr(self.cfg, "max_pose_jump", ...) at each call, so the
+            # per-frame value is picked up. Previously the three sites disagreed
+            # (tracker 0.1/1.0, here 1.0/2.0, photometric 0.5/20.0), and the
+            # 1.0 m effective threshold was 220x the GT per-frame motion, so it
+            # never fired.
+            jump_t_lim, jump_r_lim = self._jump_limit()
+            self.tracker.cfg.max_pose_jump = jump_t_lim
 
             # Stage 1: Photometric Initialization / Refinement
             use_photometric = self.tracker_cfg.use_photometric_refinement and (self.cnt < self.tracker_cfg.n_init_frames or self.gs_ready)
@@ -520,14 +598,21 @@ class BundleSdfGS:
                 T_guess_new = T_CiO_refined @ np.linalg.inv(self.poses[0])
 
                 
-                # Safety check: reject if photometric refinement moved too much
+                # Safety check: reject if photometric refinement moved too much.
+                # Shares the adaptive limit with the geometric gate below -- one
+                # frame cannot move further than that whether the estimate came
+                # from LM on the GS or from RANSAC PnP. The comparison was
+                # hardcoded to 0.5 m / 20 deg and logged with logging.info, which
+                # is invisible at the WARNING root level, so these rejections
+                # never appeared in the logs.
                 diff_t = np.linalg.norm(T_guess_new[:3, 3] - T_guess_rel[:3, 3])
                 diff_R = np.rad2deg(np.arccos(np.clip((np.trace(T_guess_new[:3, :3] @ T_guess_rel[:3, :3].T) - 1) / 2, -1, 1)))
-                
-                if diff_t > 0.5 or diff_R > 20.0:
-                    logging.info(
+
+                if diff_t > jump_t_lim or diff_R > jump_r_lim:
+                    print(
                         f"[BundleSdfGS] Rejecting photometric refinement "
-                        f"({diff_t:.4f}m, {diff_R:.2f}deg > 0.5m / 20deg); keeping geometric guess"
+                        f"({diff_t:.4f}m, {diff_R:.2f}deg > {jump_t_lim:.4f}m / {jump_r_lim:.2f}deg); "
+                        f"keeping geometric guess"
                     )
                 else:
                     print(f"[BundleSdfGS] Photometric refinement adjusted guess: {diff_t:.6f}m, {diff_R:.6f}deg")
@@ -544,22 +629,32 @@ class BundleSdfGS:
             self.timings["Geometric Tracking"].append(time.perf_counter() - t0_geo)
             
             jump = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
-            # Relaxed jump threshold if inliers are high
-            max_jump = 1.0 if n_inliers < 50 else 2.0
-            pnp_rejected = (not success) or (n_inliers < self.tracker_cfg.min_pnp_inliers) or (jump > max_jump)
+            pnp_rejected = (not success) or (n_inliers < self.tracker_cfg.min_pnp_inliers) or (jump > jump_t_lim)
             if pnp_rejected:
-                logging.info(
+                self.pnp_rejections += 1
+                print(
                     f"[BundleSdfGS] Rejecting PnP (inliers={n_inliers}, jump={jump:.4f}m "
-                    f"> max_jump={max_jump}m); falling back to velocity guess"
+                    f"> max_jump={jump_t_lim:.4f}m); falling back to velocity guess"
                 )
                 # step_informed_with_occlusion stores the rejected pose in tracker.poses,
                 # so write the guess back explicitly -- reading tracker.poses[cnt] here
                 # would silently re-accept the pose we just rejected.
                 self.tracker.poses[self.cnt] = T_guess
                 self.poses[self.cnt] = T_guess
-                # DON'T add points yet as the pose is suspect
+                # DON'T add points yet as the pose is suspect. Critically, cnt is
+                # NOT appended to accepted_rel: the frozen estimate becomes the
+                # anchor for the next frame's velocity.
             else:
                 self.poses[self.cnt] = self.tracker.poses[self.cnt]
+                # Record the accepted step for velocity prediction and for
+                # calibrating next frame's jump limit.
+                if self.accepted_rel:
+                    T_prev = self.tracker.poses[self.accepted_rel[-1]]
+                    self.accepted_step_t.append(float(np.linalg.norm(
+                        self.tracker.poses[self.cnt][:3, 3] - T_prev[:3, 3])))
+                    self.accepted_step_r.append(float(np.rad2deg(np.arccos(np.clip(
+                        (np.trace(self.tracker.poses[self.cnt][:3, :3].T @ T_prev[:3, :3]) - 1) / 2, -1, 1)))))
+                self.accepted_rel.append(self.cnt)
                 # If we are low on points AND PnP was successful, add more
                 if len(self.tracker.tracks) < 300:
                     self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, self.tracker.poses[self.cnt], align=True)
