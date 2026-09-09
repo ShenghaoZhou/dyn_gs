@@ -54,6 +54,11 @@ class GlobalConfig:
     clip_id: str = "clip-003312"
     device: str = "cuda"
     num_frames: int = 150
+    # RNG seed for every spawned worker. Two 150-frame runs on the identical
+    # model_infer path measured mean ATE 0.1896 m and 0.3998 m (Umeyama s
+    # 0.9433 vs 1.1221), so anything below ~2x on a single run is inside the
+    # pipeline's own run-to-run noise. Seed before comparing any two configs.
+    seed: int = 0
     # Which depth buffer to feed the tracker and mapper. This single choice sets
     # the ABSOLUTE SCALE of everything downstream: tracker 3D tracks, GS means,
     # GS scales (obj_gs_mapping densify scales Gaussians by z) and ray_dist are
@@ -131,10 +136,38 @@ class GlobalConfig:
     # Tracker specific
     use_informed_filtering: bool = True
     use_occlusion_check: bool = True
-    align_depth: bool = True
+    # Depth alignment, split by consumer. Previously a single align_depth flag
+    # reached the mapper but never the tracker -- GeoTrackerConfig(...) below
+    # omitted it -- so the tracker silently ran unaligned at all times, and the
+    # "monocular_scale_alignment=True but align_depth=False" warning fired on
+    # every run because it tested two flags that were both stuck at their
+    # defaults. The defaults here reproduce today's ACTUAL behavior: mapper
+    # aligns, tracker does not.
+    align_depth_mapper: bool = True
+    align_depth_tracker: bool = False
     align_with_bias: bool = True
     multiprocess_dyn: bool = False # Default to False as in test_hot3d.py
     use_pgsr: bool = False
+
+
+def set_seed(seed: int):
+    """Seed every RNG the pipeline draws from, inside a spawned worker.
+
+    'spawn' workers do not inherit the parent's RNG state, so each one has to
+    seed itself or its draws depend on process startup order. The remaining
+    variance after seeding is torch.rand_like / randperm in
+    obj_gs_mapping.densify() and CUDA non-deterministic reductions in the
+    renderer; use_deterministic_algorithms(True, warn_only=True) swaps those for
+    deterministic kernels without aborting when no deterministic kernel exists.
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
 
 # Depth buffers available on disk for a clip, by short name. Only the
 # chosen one is actually loaded; every other source below shares the same
@@ -146,15 +179,21 @@ class GlobalConfig:
 #   DA3METRIC    s=1.04 @30f, 0.44 @150f        <- metric at short range
 #   moge         s=1.25 @30f
 # DA3METRIC is the genuinely metric source and cut 30-frame raw ATE 0.1715 ->
-# 0.0290 m, but over 150 frames it REGRESSES to 0.6591 m (vs 0.1896-0.3998 for
-# model_infer) because the GS mapper collapses around frame 25: mask loss rises
-# 0.001 -> 0.187 and PnP inliers drop to 0, so the pose is frozen at the
-# velocity guess. That mapper failure is separate from scale, so the default
-# stays model_infer -- keep this default until the frame-25 collapse is fixed.
+# 0.0290 m, but over 150 frames it REGRESSED to 0.6591 m (vs 0.1896-0.3998 for
+# model_infer) because the GS mapper collapsed around frame 25: mask loss rose
+# 0.001 -> 0.187 and PnP inliers dropped to 0, so the pose froze at the velocity
+# guess. That collapse was the PnP rejection poisoning the map, not scale: after
+# gating the GS keyframe commit on pnp_rejected it improved to 0.4537 m and the
+# frame-25 step is gone (25-49 segment mean 0.694 -> 0.374, error now grows
+# monotonically instead of stepping). Still behind model_infer, so the default
+# stays model_infer.
 #
 # The pipeline is also stochastic: two 150-frame runs on the identical
 # model_infer path gave 0.1896 m and 0.3998 m mean ATE (Umeyama s 0.94 and
-# 1.12). Single-run ATE deltas below ~2x are noise.
+# 1.12), and the same holds after seeding (0.4411 and 0.2140, seeds 0 and 1).
+# The gate reduced PnP rejections 67 -> 23-26/150, which is a real and stable
+# effect, but it did not close the ~2x cross-seed spread. Seed every run before
+# comparing two configs, and don't read single-run ATE deltas below ~2x.
 DEPTH_SOURCES = {
     "model_infer":    ("model_infer",          "depth_{i:05d}.npy"),
     "dyn_obj_masked": ("dyn_obj_masked_infer", "depth_{i:05d}.npy"),
@@ -258,6 +297,7 @@ def load_frame_data_v2(data_dir, frame_idx, depth_source="model_infer"):
     }
 
 def data_loader_worker(cfg, static_q, dynamic_q):
+    set_seed(cfg.seed + 1000)
     data_dir = Path(cfg.data_root) / cfg.clip_id
     count = 0
     for i in range(cfg.num_frames):
@@ -275,6 +315,7 @@ def data_loader_worker(cfg, static_q, dynamic_q):
     dynamic_q.put(None)
 
 def static_scene_worker(cfg, bg_queue, data_q):
+    set_seed(cfg.seed + 2000)
     from gs_scene.scene_model import SceneModel
     try:
         from old_ref.keyframe_window import KeyFrameWindow
@@ -350,12 +391,17 @@ def umeyama(src, dst):
 
 
 def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
+    set_seed(cfg.seed)
     print(f"[Dynamic Worker] Starting on {cfg.device}")
     device = torch.device(cfg.device)
     # Record which depth buffer this run used: it fixes the absolute scale of
     # the entire trajectory, so two runs differing only in depth_source are
     # measuring different units and their ATEs are not comparable.
     print(f"[Dynamic Worker] depth_source={cfg.depth_source}")
+    # Echo the seed: without it, two runs of the same config can differ by
+    # more than 2x on mean ATE, so a run with no seed on its header is
+    # not comparable to anything else.
+    print(f"[Dynamic Worker] seed={cfg.seed}")
     
     # Initialize Tracker and Mapping configs for BundleSdfGS
     tracker_cfg = GeoTrackerConfig(
@@ -375,7 +421,11 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         use_occlusion_check=cfg.use_occlusion_check,
         min_kf_rot=cfg.min_kf_rot,
         kf_overlap_thresh=cfg.kf_overlap_thresh,
-        min_kf_interval=cfg.min_kf_interval
+        min_kf_interval=cfg.min_kf_interval,
+        # Explicitly wired: see the align_depth_mapper / align_depth_tracker
+        # comment in GlobalConfig. This is intentionally False.
+        align_depth=cfg.align_depth_tracker,
+        align_with_bias=cfg.align_with_bias,
     )
     
     map_cfg = MappingConfig(
@@ -390,7 +440,7 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         densify_every=cfg.densify_every,
         prune_every=cfg.prune_every,
         mask_loss_weight=cfg.mask_loss_weight,
-        align_depth=cfg.align_depth,
+        align_depth=cfg.align_depth_mapper,
         align_with_bias=cfg.align_with_bias,
         use_pgsr=cfg.use_pgsr
     )
@@ -618,6 +668,8 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
 
             print(f">>> Raw:                Mean={np.mean(ates):.4f}m, Max={np.max(ates):.4f}m")
             print(f">>> PnP rejections:     {tracker.pnp_rejections}/{len(ates)} frames")
+            print(f">>> Keyframes skipped:  {tracker.kf_skipped_reject} (PnP rejected, "
+                  f"pose frozen -- geometry withheld from the map)")
             print(f">>> Scale-aligned (s={s:.4f}):        RMSE={np.sqrt(np.mean(err_sc ** 2)):.4f}m, Max={err_sc.max():.4f}m")
             print(f">>> Umeyama-aligned (s={s:.4f}):      RMSE={np.sqrt(np.mean(err ** 2)):.4f}m, Max={err.max():.4f}m")
             if np.isclose(s, 1.0, atol=1e-3):
@@ -641,6 +693,10 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
 def main():
     try: mp.set_start_method('spawn', force=True)
     except: pass
+
+    # Must precede CUDA init in the workers: without it cuBLAS reductions fall
+    # back to non-deterministic kernels and two identical runs still differ.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     
     cfg = tyro.cli(GlobalConfig)
     ctx = mp.get_context('spawn')

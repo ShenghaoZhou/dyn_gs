@@ -772,7 +772,7 @@ class GeometricTracker:
                         T = T_guess.copy()
                         n_inliers = n_inliers_guess
                     elif n_inliers < getattr(self.cfg, "min_pnp_inliers", 20):
-                        print(f"[GeoTracker] Rejecting PnP (inliers: {n_inliers} < {getattr(self.cfg, 'min_pnp_inliers', 15)})")
+                        print(f"[GeoTracker] Rejecting PnP (inliers: {n_inliers} < {getattr(self.cfg, 'min_pnp_inliers', 20)})")
                         T = T_guess.copy()
                         n_inliers = n_inliers_guess
             else:

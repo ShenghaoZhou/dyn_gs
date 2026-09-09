@@ -72,12 +72,16 @@ class GeoTrackerConfig:
     use_occlusion_check: bool = False
     use_informed_filtering: bool = False
     informed_thresh: float = 50.0 # Relaxed pixels
-    # NOTE: not consumed by the tracker -- align_depth is what actually enables
-    # alignment. estimate_depth_alignment() corrects *per-frame* scale drift
-    # against already-tracked points; it cannot fix an unknown *absolute* scale,
-    # which would need an external reference (GT rel pose, GPS, ...) that this
-    # system does not have.
-    monocular_scale_alignment: bool = True
+    # Depth alignment for the tracker. Kept OFF and wired explicitly from the
+    # runner: estimate_depth_alignment() regresses the depth buffer against
+    # t['pt3d'], which was itself lifted from the same buffer and then overwritten
+    # by GS means from the same buffer, so it is circular and cannot recover an
+    # unknown absolute scale -- only per-frame drift against already-tracked
+    # points. The mapper has its own separate align_depth flag
+    # (obj_gs_mapping.MappingConfig); that is the one the pipeline calibrates on.
+    #
+    # The old monocular_scale_alignment flag was removed: it was read by nobody
+    # except the warning below, so it advertised a calibration that never ran.
     align_depth: bool = False
     align_with_bias: bool = True
     
@@ -157,6 +161,13 @@ class BundleSdfGS:
         self.accepted_step_t = []
         self.accepted_step_r = []
         self.pnp_rejections = 0
+        # Keyframes that the periodic/init rule wanted to take but the PnP
+        # rejection flag suppressed. These are frames whose pose was the velocity
+        # guess rather than a measurement, so lifting depth points at them and
+        # committing them to the GS keyframe buffer would have poisoned the map.
+        # Counted for the summary so a drop in keyframe count is not mistaken
+        # for the mapper stalling.
+        self.kf_skipped_reject = 0
         
         # Shared state for mapper
         self.kf_queue = multiprocessing.Queue(maxsize=10)
@@ -181,12 +192,10 @@ class BundleSdfGS:
         self.prev_mask = None
 
         # Surface config combinations that silently weaken the pipeline.
-        if tracker_cfg.monocular_scale_alignment and not tracker_cfg.align_depth:
-            logging.warning(
-                "[BundleSdfGS] monocular_scale_alignment=True but align_depth=False: "
-                "depth is NOT scale-aligned. Every meter-valued threshold here "
-                "(velocity cap, pose jump, PnP inliers) assumes metric depth."
-            )
+        # The old monocular_scale_alignment/align_depth warning here fired on
+        # every single run because the runner never passed either flag through,
+        # so it was pure noise. That wiring is now explicit (see
+        # align_depth_tracker in the runner) and the dead flag is gone.
         if not (tracker_cfg.use_occlusion_check or tracker_cfg.use_informed_filtering):
             logging.warning(
                 "[BundleSdfGS] use_occlusion_check and use_informed_filtering are both off: "
@@ -458,6 +467,11 @@ class BundleSdfGS:
         """
         t_start = time.perf_counter()
         self.cnt += 1
+        # Frame 0 has no PnP (no previous pose to compare against), so the
+        # geometric stage never runs and the keyframe commit below would read an
+        # undefined name. Default to "not rejected" and let the geometric stage
+        # overwrite it for cnt > 0.
+        pnp_rejected = False
         H, W = color.shape[:2]
         
         if self.cnt == 0:
@@ -684,6 +698,19 @@ class BundleSdfGS:
                 if rot_diff_deg < self.tracker_cfg.min_kf_rot or overlap > self.tracker_cfg.kf_overlap_thresh:
                     is_redundant = True
                     break
+            # Deliberately NOT gated on pnp_rejected. Two earlier attempts gated
+            # this and both starved the tracker: is_kf drives add_new_points_from_depth
+            # below, which is the tracker's ONLY replenishment path. Withhold it and
+            # len(pts2d) falls under min_pnp_inliers, so geometric_tracker returns
+            # (False, 0) -- the "inliers=0" logs -- every subsequent frame rejects,
+            # the pose freezes at the velocity guess, and nothing ever recovers.
+            # Measured: 67/150 rejections -> 140/150 with mean ATE 0.19 -> 0.45.
+            #
+            # What IS gated on pnp_rejected is the GS keyframe commit below, which
+            # is the actual poison: the mapper optimizes Gaussians toward
+            # frame_data["T_CiO"], so a velocity-guess pose bakes the error into
+            # the means and update_object_points() then snaps surviving tracks
+            # onto those wrong means.
             if not is_redundant: is_kf = True
             if self.cnt % 5 == 0: is_kf = True
             if self.cnt < self.tracker_cfg.n_init_frames: is_kf = True
@@ -700,22 +727,34 @@ class BundleSdfGS:
 
         # Update keyframe if needed
         if is_kf:
-            self.keyframes.append(self.cnt)
-            self.tracker.keyframes.append(self.cnt)
-            # Update tracker with new points
-            # If GS is ready, use optimized GS depth but ONLY for high-confidence regions
-            # Robustly use only monocular depth for points to avoid GS reconstruction noise
-            curr_depth = depth
-            
+            # Update tracker with new points. Runs on the keyframe cadence and is
+            # deliberately UNGATED on pnp_rejected -- see the is_kf comment above.
+            # Injecting at a suspect pose is mildly wrong but harmless; skipping it
+            # starves the tracker and rejects every subsequent frame.
             self.tracker.add_new_points_from_depth(
-                self.cnt, color, mask, curr_depth, K, 
-                self.tracker.poses[self.cnt], 
+                self.cnt, color, mask, depth, K,
+                self.tracker.poses[self.cnt],
                 align=(self.cnt >= self.tracker_cfg.n_init_frames)
             )
-            
-            # Update mapper with object-centric pose
-            kf_data = {"frame_idx": self.cnt, "image": color, "mask": mask, "depth": depth, "K": K, "T_CiO": T_CiO}
-            self._enqueue_keyframe(kf_data)
+
+            # Committing to the GS keyframe buffer is gated. The mapper optimizes
+            # Gaussians toward frame_data["T_CiO"], so a velocity-guess pose bakes
+            # its error into the means; update_object_points() then snaps the
+            # tracker's surviving tracks onto those wrong means, which is what made
+            # the next PnP find < min_pnp_inliers points and collapse. Withholding
+            # the frame here costs the mapper one view without freezing the tracker.
+            if pnp_rejected:
+                self.kf_skipped_reject += 1
+                print(
+                    f"[BundleSdfGS] Frame {self.cnt} is a keyframe but PnP was "
+                    f"rejected: tracker points injected, GS keyframe withheld"
+                )
+            else:
+                self.keyframes.append(self.cnt)
+                self.tracker.keyframes.append(self.cnt)
+                # Update mapper with object-centric pose
+                kf_data = {"frame_idx": self.cnt, "image": color, "mask": mask, "depth": depth, "K": K, "T_CiO": T_CiO}
+                self._enqueue_keyframe(kf_data)
         
         self.timings["Total run()"].append(time.perf_counter() - t_start)
         self.prev_mask = mask.copy()
