@@ -1,0 +1,1 @@
+pixi run python full_system_ow/eval_system_ph2d.py --num-frames 200 --no-vis --save-render --init-frame 100 --use-model-pose --num-steps-static 50 --clip-id 403-pick_on_color_pad_left-2025_01_09-16_58_04/processed_episode_10

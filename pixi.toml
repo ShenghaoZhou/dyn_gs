@@ -19,6 +19,7 @@ matplotlib = ">=3.10.8,<4"
 tqdm = ">=4.67.3,<5"
 plyfile = ">=1.1,<2"
 cuda-compiler = ">=12.9.1,<13"
+cuda-libraries-dev = ">=12.9.0,<13"
 tensorboard = ">=2.20.0,<3"
 torchvision = ">=0.24.0,<0.25"
 numpy = "<2"
@@ -37,6 +38,8 @@ pytorch3d = ">=0.7.7,<0.8"
 cuda-sanitizer-api = ">=12.9.79,<13"
 ninja = ">=1.13.2,<2"
 cxx-compiler = ">=1.5.1,<2"
+pip = ">=26.1.1,<27"
+poselib = ">=2.0.4,<3"
 
 
 [pypi-options]
@@ -44,3 +47,4 @@ no-build-isolation = ["gsplat"]
 
 [pypi-dependencies]
 gsplat = { path = "./gsplat" }
+poselib = { path = "./PoseLib" }

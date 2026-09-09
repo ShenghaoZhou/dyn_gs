@@ -1,0 +1,19 @@
+# Vendored third-party checkouts (large; install via pixi instead)
+PoseLib/
+gsplat/
+
+# Datasets (symlinks to machine-specific paths) and generated outputs
+data/
+renders/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Tooling caches
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
