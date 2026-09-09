@@ -85,6 +85,17 @@ class GeoTrackerConfig:
     align_depth: bool = False
     align_with_bias: bool = True
     
+    # When PnP rejects a frame, withhold that frame from the GS keyframe buffer.
+    #
+    # Measured OFF. A paired 5-clip A/B (same code, same seed, same clip, only
+    # this flag differing) found withholding rejected keyframes made things
+    # worse everywhere: 0/5 clips improved on scale-free ATE/travel, and
+    # aggregate mean ATE/travel went 0.215 -> 0.371 (+72%), mean Umeyama RMSE
+    # 0.1015 -> 0.1247 (+23%). The cost is map sparsity -- withheld frames are
+    # views the mapper never sees -- and it exceeds whatever the poisoning
+    # would have caused. A rejected pose is bad data, but it is still a view.
+    # Kept as a switch so the A/B stays reproducible; default is OFF.
+    gate_kf_commit: bool = False
     gs_type: str = "2d" # "2d" or "3d"
     photometric_mode: str = "lm" # "hybrid", "adam", or "lm"
     use_match_projections: bool = False
@@ -161,12 +172,10 @@ class BundleSdfGS:
         self.accepted_step_t = []
         self.accepted_step_r = []
         self.pnp_rejections = 0
-        # Keyframes that the periodic/init rule wanted to take but the PnP
-        # rejection flag suppressed. These are frames whose pose was the velocity
-        # guess rather than a measurement, so lifting depth points at them and
-        # committing them to the GS keyframe buffer would have poisoned the map.
-        # Counted for the summary so a drop in keyframe count is not mistaken
-        # for the mapper stalling.
+        # Keyframes that the periodic/init rule wanted to take but the gate
+        # suppressed (only nonzero when gate_kf_commit is True, which defaults
+        # False -- see GeoTrackerConfig). Counted for the summary so a drop in
+        # keyframe count is not mistaken for the mapper stalling.
         self.kf_skipped_reject = 0
         
         # Shared state for mapper
@@ -737,13 +746,30 @@ class BundleSdfGS:
                 align=(self.cnt >= self.tracker_cfg.n_init_frames)
             )
 
-            # Committing to the GS keyframe buffer is gated. The mapper optimizes
-            # Gaussians toward frame_data["T_CiO"], so a velocity-guess pose bakes
-            # its error into the means; update_object_points() then snaps the
-            # tracker's surviving tracks onto those wrong means, which is what made
-            # the next PnP find < min_pnp_inliers points and collapse. Withholding
-            # the frame here costs the mapper one view without freezing the tracker.
-            if pnp_rejected:
+            # This gate defaults to OFF -- see GeoTrackerConfig.gate_kf_commit.
+            # The hypothesis was that committing a velocity-guess pose poisons the
+            # map, because the mapper optimizes Gaussians toward frame_data["T_CiO"]
+            # and update_object_points() then snaps surviving tracks onto those
+            # means. A paired 5-clip A/B tested exactly that and it did not hold:
+            # withholding the frame cost the mapper a view every time and never
+            # reduced the error, so the poisoned-view harm was smaller than the
+            # sparsity harm. Two side observations from the same run:
+            #   * Rejection counts did not diverge. Gate ON 17/89/8/72/54 vs
+            #     gate OFF 13/116/17/85/51 (same clip order), comparable on every
+            #     clip, and the gate-OFF runs did NOT enter the unrecoverable
+            #     state. So the unrecoverable death spiral traced to gating is_kf
+            #     (which starves add_new_points_from_depth), NOT to committing a
+            #     rejected keyframe. is_kf stays ungated for that reason.
+            #   * The depth scale error tracked rejection rate, not the gate.
+            #     Low-rejection clips (8-17/150) came out near metric, s=0.86-1.11.
+            #     High-rejection clips (72-116/150) came out compressed,
+            #     s=0.17-0.52 -- both variants of clip-003318 sat at s~0.17-0.18.
+            #     One mid-rejection clip (51-54/150) came out EXPANDED, s=1.58-2.71,
+            #     so the sign of the error is not fixed, only its magnitude. Either
+            #     way, rejecting banks the velocity guess, which on those clips is
+            #     smaller than the true motion, and that is the dominant error
+            #     source across the dataset. This gate does not touch it.
+            if self.tracker_cfg.gate_kf_commit and pnp_rejected:
                 self.kf_skipped_reject += 1
                 print(
                     f"[BundleSdfGS] Frame {self.cnt} is a keyframe but PnP was "

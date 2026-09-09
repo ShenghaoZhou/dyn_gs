@@ -64,8 +64,10 @@ class GlobalConfig:
     # GS scales (obj_gs_mapping densify scales Gaussians by z) and ray_dist are
     # all lifted from this buffer, so none of them can know its own scale.
     # "model_infer" is the pipeline's original non-metric source. DA3METRIC is
-    # metric but currently regresses over long runs. See DEPTH_SOURCES below for
-    # the measured numbers.
+    # metric but currently regresses over long runs (cause not established --
+    # see DEPTH_SOURCES below), and the dominant error source across clips is
+    # rejection-driven scale compression, not the depth source. The default is
+    # the pipeline's original choice.
     depth_source: str = "model_infer"
     init_frame: int = 0
     n_features: int = 2000
@@ -148,6 +150,13 @@ class GlobalConfig:
     align_with_bias: bool = True
     multiprocess_dyn: bool = False # Default to False as in test_hot3d.py
     use_pgsr: bool = False
+    # Withhold PnP-rejected frames from the GS keyframe buffer. Default OFF,
+    # measured that way: a paired 5-clip A/B (same code, same seed, same clip,
+    # only this flag differing) found 0/5 clips improved on scale-free ATE/travel
+    # and the aggregate went 1.7x worse. See GeoTrackerConfig.gate_kf_commit.
+    # Kept as a switch so the A/B stays reproducible -- matched seeds are the
+    # only way to separate a flag's effect from run-to-run variance here.
+    gate_kf_commit: bool = False
 
 
 def set_seed(seed: int):
@@ -174,26 +183,44 @@ def set_seed(seed: int):
 # loader plumbing. "model_infer" is the pipeline's historical default and is
 # the one the reported baselines were produced with.
 #
-# Measured on clip-003312 (Umeyama s vs GT, metric == 1.0):
+# Measured on clip-003312, single runs (Umeyama s vs GT, metric == 1.0). The
+# pipeline swings 3-4x run to run even at fixed config and seed, so treat
+# these as order-of-magnitude, not as measurements:
 #   model_infer  s=0.35 @30f, 0.94-1.12 @150f   <- non-metric, unstable
 #   DA3METRIC    s=1.04 @30f, 0.44 @150f        <- metric at short range
 #   moge         s=1.25 @30f
-# DA3METRIC is the genuinely metric source and cut 30-frame raw ATE 0.1715 ->
-# 0.0290 m, but over 150 frames it REGRESSED to 0.6591 m (vs 0.1896-0.3998 for
-# model_infer) because the GS mapper collapsed around frame 25: mask loss rose
-# 0.001 -> 0.187 and PnP inliers dropped to 0, so the pose froze at the velocity
-# guess. That collapse was the PnP rejection poisoning the map, not scale: after
-# gating the GS keyframe commit on pnp_rejected it improved to 0.4537 m and the
-# frame-25 step is gone (25-49 segment mean 0.694 -> 0.374, error now grows
-# monotonically instead of stepping). Still behind model_infer, so the default
+# DA3METRIC is genuinely metric and cut 30-frame raw ATE 0.1715 -> 0.0290 m,
+# but over 150 frames it REGRESSED to 0.6591 m (vs 0.1896-0.3998 for
+# model_infer) with a sharp step at frame 25: mask loss rose 0.001 -> 0.187,
+# PnP inliers dropped to 0, and the pose froze at the velocity guess.
+#
+# The CAUSE of that step is still not established. An early reading blamed PnP
+# rejection poisoning the map and found a smaller gate-on run (0.6591 -> 0.4537
+# m, 25-49 segment 0.694 -> 0.374) that looked like confirmation -- but that
+# comparison was unpaired, and a paired 5-clip A/B on model_infer (same code,
+# same seed, same clip, only the gate differing) showed the gate is worse on
+# 0/5 clips: aggregate mean ATE/travel 0.215 -> 0.371. So the frame-25 step
+# cannot be credited to keyframe poisoning, and the gate fix is reverted
+# (gate_kf_commit defaults False). Still behind model_infer, so the default
 # stays model_infer.
+#
+# Across-clip A/B on model_infer found the dominant error source is depth-buffer
+# scale error that tracks PnP rejection rate, not the gate: low-rejection clips
+# (8-17/150) came out Umeyama s=0.86-1.11 (near metric), high-rejection clips
+# (72-116/150) came out compressed at s=0.17-0.52 (both gate variants of
+# clip-003318 sat at s~0.17-0.18 with 89 and 116 rejections), and one
+# mid-rejection clip (51-54/150) came out expanded at s=1.58-2.71. So the SIGN
+# of the error is not fixed, only its magnitude. Either way, rejecting banks the
+# velocity guess, which on those clips is smaller than the true motion. That is
+# the next thing to fix, not the depth source.
 #
 # The pipeline is also stochastic: two 150-frame runs on the identical
 # model_infer path gave 0.1896 m and 0.3998 m mean ATE (Umeyama s 0.94 and
-# 1.12), and the same holds after seeding (0.4411 and 0.2140, seeds 0 and 1).
-# The gate reduced PnP rejections 67 -> 23-26/150, which is a real and stable
-# effect, but it did not close the ~2x cross-seed spread. Seed every run before
-# comparing two configs, and don't read single-run ATE deltas below ~2x.
+# 1.12), and the same holds after seeding (0.4411 and 0.2140, seeds 0 and 1);
+# three runs at IDENTICAL config and seed 0 gave 0.4411, 0.1321 and 0.1039 m --
+# a 4.2x swing, so part of the "seed variance" was GPU contention. Seed every
+# run before comparing two configs, and don't read single-run ATE deltas below
+# ~2x. Single-clip comparisons are unreadable; use multi-clip aggregates.
 DEPTH_SOURCES = {
     "model_infer":    ("model_infer",          "depth_{i:05d}.npy"),
     "dyn_obj_masked": ("dyn_obj_masked_infer", "depth_{i:05d}.npy"),
@@ -426,6 +453,7 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         # comment in GlobalConfig. This is intentionally False.
         align_depth=cfg.align_depth_tracker,
         align_with_bias=cfg.align_with_bias,
+        gate_kf_commit=cfg.gate_kf_commit,
     )
     
     map_cfg = MappingConfig(
