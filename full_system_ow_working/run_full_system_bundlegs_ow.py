@@ -210,9 +210,12 @@ def set_seed(seed: int):
 # (72-116/150) came out compressed at s=0.17-0.52 (both gate variants of
 # clip-003318 sat at s~0.17-0.18 with 89 and 116 rejections), and one
 # mid-rejection clip (51-54/150) came out expanded at s=1.58-2.71. So the SIGN
-# of the error is not fixed, only its magnitude. Either way, rejecting banks the
-# velocity guess, which on those clips is smaller than the true motion. That is
-# the next thing to fix, not the depth source.
+# of the error is not fixed, only its magnitude. Splitting rejections by reason,
+# the good clips reject on the jump gate with real inliers (clip-003312: 5/13
+# had >=10 inliers, median jump 0.299 vs limit 0.150) while the bad clips reject
+# with 0 inliers and median jump 0.000 -- the len(pts2d) < min_pnp_inliers guard
+# in geometric_tracker bailing at 19 observations, so PnP never runs at all.
+# Upstream of any threshold; that is the next thing to fix, not the depth source.
 #
 # The pipeline is also stochastic: two 150-frame runs on the identical
 # model_infer path gave 0.1896 m and 0.3998 m mean ATE (Umeyama s 0.94 and

@@ -765,10 +765,14 @@ class BundleSdfGS:
             #     High-rejection clips (72-116/150) came out compressed,
             #     s=0.17-0.52 -- both variants of clip-003318 sat at s~0.17-0.18.
             #     One mid-rejection clip (51-54/150) came out EXPANDED, s=1.58-2.71,
-            #     so the sign of the error is not fixed, only its magnitude. Either
-            #     way, rejecting banks the velocity guess, which on those clips is
-            #     smaller than the true motion, and that is the dominant error
-            #     source across the dataset. This gate does not touch it.
+            #     so the sign of the error is not fixed, only its magnitude.
+            #     Logging the reject reason splits them two ways: clip-003312
+            #     (near metric) rejects on the jump gate with real inliers
+            #     (5/13 had >=10 inliers, median jump 0.299 vs limit 0.150); the
+            #     three bad clips reject with 0 inliers and median jump 0.000 --
+            #     i.e. the len(pts2d) < min_pnp_inliers guard in geometric_tracker
+            #     bailing at 19 observations, one short of 20, so PnP never runs.
+            #     That is upstream of any threshold. This gate does not touch it.
             if self.tracker_cfg.gate_kf_commit and pnp_rejected:
                 self.kf_skipped_reject += 1
                 print(
