@@ -126,6 +126,7 @@ class Any4DMultiViewEngine:
         use_known_poses: bool = True,
         min_scene_flow_mag: float = 0.005,
         min_mask_pts: int = 25,
+        crop_small_objects: bool = False,
     ):
         self.device = torch.device(device)
         self.window_size = window_size
@@ -133,6 +134,7 @@ class Any4DMultiViewEngine:
         self.use_known_poses = use_known_poses
         self.min_scene_flow_mag = min_scene_flow_mag
         self.min_mask_pts = min_mask_pts
+        self.crop_small_objects = crop_small_objects
 
         self.checkpoint_path = str((_WORKSPACE_ROOT / checkpoint_path).resolve())
         self.config_dir = str((_WORKSPACE_ROOT / config_dir).resolve())
@@ -144,6 +146,7 @@ class Any4DMultiViewEngine:
         self.frame_history: List[Dict[str, Any]] = []
         self.orig_hw: Optional[Tuple[int, int]] = None
         self._is_initialized = False
+        self.crop_box: Optional[Tuple[int, int, int, int]] = None
 
     def lazy_load_model(self):
         if self.model is not None:
@@ -170,6 +173,25 @@ class Any4DMultiViewEngine:
         self.model = model
         print("[Any4D Engine] Model loaded successfully.")
 
+    def compute_crop_box(self, mask: np.ndarray, min_size: int = 140, pad_factor: float = 2.5) -> Optional[Tuple[int, int, int, int]]:
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0:
+            return None
+        ymin, ymax = ys.min(), ys.max()
+        xmin, xmax = xs.min(), xs.max()
+        bw = xmax - xmin
+        bh = ymax - ymin
+        if max(bw, bh) >= 120:
+            return None
+        cx, cy = int(np.mean(xs)), int(np.mean(ys))
+        crop_size = max(min_size, int(max(bw, bh) * pad_factor))
+        H, W = mask.shape[:2]
+        x0 = max(0, cx - crop_size // 2)
+        y0 = max(0, cy - crop_size // 2)
+        x1 = min(W, x0 + crop_size)
+        y1 = min(H, y0 + crop_size)
+        return (x0, y0, x1, y1)
+
     def set_reference_frame(
         self,
         image_rgb: np.ndarray,
@@ -186,22 +208,91 @@ class Any4DMultiViewEngine:
         H, W = image_rgb.shape[:2]
         self.orig_hw = (H, W)
 
+        self.crop_box = None
+        if self.crop_small_objects and mask is not None:
+            self.crop_box = self.compute_crop_box(mask)
+            if self.crop_box is not None:
+                x0, y0, x1, y1 = self.crop_box
+                print(f"[Any4D Engine] Tiny object detected (bbox < 120px). Activating zoom crop: [{x0}:{x1}, {y0}:{y1}]")
+
         self.ref_frame = {
             "frame_idx": 0,
             "image": image_rgb,
             "mask": mask,
             "extrin": extrin,
             "K": K,
-            "T_WO_gt": T_WO_gt
+            "T_WO_gt": T_WO_gt if T_WO_gt is not None else np.eye(4)
         }
         self.frame_history = [self.ref_frame]
+        self.anchors: List[Dict[str, Any]] = [self.ref_frame]
         self.ref_mask_resized = resize_mask(mask, self.target_resolution).to(self.device)
 
         # Run Any4D on reference frame (replicated M times for batch consistency)
         depth_0, pts3d_0, _, _ = self._run_multiview_batch([self.ref_frame] * self.window_size)
         self.ref_pts3d = pts3d_0
+        self.last_valid_T_WO = self.ref_frame["T_WO_gt"]
         self._is_initialized = True
         return depth_0
+
+    def try_add_anchor(
+        self,
+        frame_idx: int,
+        image_rgb: np.ndarray,
+        mask: Optional[np.ndarray],
+        extrin: np.ndarray,
+        K: np.ndarray,
+        T_WO_est: np.ndarray,
+        min_rot_deg: float = 25.0,
+        min_interval: int = 15
+    ) -> bool:
+        """
+        Dynamically registers a new anchor if the object has rotated > min_rot_deg
+        from existing anchors and at least min_interval frames have passed.
+        """
+        if mask is None or (mask > 0).sum() < self.min_mask_pts:
+            return False
+
+        if frame_idx - self.anchors[-1]["frame_idx"] < min_interval:
+            return False
+
+        R_curr = T_WO_est[:3, :3]
+        for anchor in self.anchors:
+            R_anc = anchor["T_WO_gt"][:3, :3]
+            R_diff = R_curr @ R_anc.T
+            rot_deg = np.degrees(np.arccos(np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)))
+            if rot_deg < min_rot_deg:
+                return False
+
+        new_anchor = {
+            "frame_idx": frame_idx,
+            "image": image_rgb.copy(),
+            "mask": mask.copy(),
+            "extrin": extrin.copy(),
+            "K": K.copy(),
+            "T_WO_gt": T_WO_est.copy()
+        }
+        self.anchors.append(new_anchor)
+        print(f"[Any4D Engine] Registered new dynamic anchor at frame {frame_idx} (Total anchors: {len(self.anchors)})")
+        return True
+
+    def select_best_anchor(self, T_WO_prior: Optional[np.ndarray]) -> Dict[str, Any]:
+        """Selects the keyframe anchor that has the closest orientation to T_WO_prior."""
+        if not self.anchors or T_WO_prior is None or len(self.anchors) == 1:
+            return self.anchors[0]
+
+        R_prior = T_WO_prior[:3, :3]
+        best_anchor = self.anchors[0]
+        best_dist = float("inf")
+        for anchor in self.anchors:
+            R_anc = anchor["T_WO_gt"][:3, :3]
+            R_diff = R_prior @ R_anc.T
+            rot_deg = np.degrees(np.arccos(np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)))
+            t_diff = np.linalg.norm(T_WO_prior[:3, 3] - anchor["T_WO_gt"][:3, 3])
+            score = rot_deg + t_diff * 50.0
+            if score < best_dist:
+                best_dist = score
+                best_anchor = anchor
+        return best_anchor
 
     def process_frame(
         self,
@@ -210,9 +301,10 @@ class Any4DMultiViewEngine:
         mask: Optional[np.ndarray],
         extrin: np.ndarray,
         K: np.ndarray,
+        T_WO_prior: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Processes frame t with Any4D multi-view window.
+        Processes frame t with Any4D multi-view window anchored to the best keyframe anchor.
         Returns:
             depth_z_full: (H, W) Metric camera depth map (replaces MapAnything).
             T_CO_est: (4, 4) Rigid camera-from-object pose estimate from 3D scene flow.
@@ -231,22 +323,25 @@ class Any4DMultiViewEngine:
         }
         self.frame_history.append(curr_frame)
 
-        # Form M-view window: [ref_frame, past_kfs..., curr_frame]
-        window = [self.ref_frame]
+        # Select the best anchor based on current pose prior
+        anchor = self.select_best_anchor(T_WO_prior if T_WO_prior is not None else self.last_valid_T_WO)
+
+        # Form M-view window: [best_anchor, past_kfs..., curr_frame]
+        window = [anchor]
         remaining = self.window_size - 1
         recent = self.frame_history[1:]
         if len(recent) < remaining:
-            # Pad with current frame
             window.extend([recent[-1]] * (remaining - len(recent)))
             window.extend(recent)
         else:
             window.extend(recent[-remaining:])
 
-        return self._run_multiview_batch(window)
+        return self._run_multiview_batch(window, T_WO_prior=T_WO_prior)
 
     def _run_multiview_batch(
         self,
-        window_frames: List[Dict[str, Any]]
+        window_frames: List[Dict[str, Any]],
+        T_WO_prior: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """Executes multi-view forward pass over window_frames and extracts metrics."""
         from any4d.utils.inference import loss_of_one_batch_multi_view
@@ -254,10 +349,35 @@ class Any4DMultiViewEngine:
         tH, tW = self.target_resolution
         orig_h, orig_w = self.orig_hw
 
+        crop_coords = getattr(self, "crop_box", None)
+        if crop_coords is not None:
+            x0, y0, x1, y1 = crop_coords
+        else:
+            x0, y0, x1, y1 = 0, 0, orig_w, orig_h
+        proc_h, proc_w = y1 - y0, x1 - x0
+
         views = []
         for i, frame in enumerate(window_frames):
-            img_norm = normalize_image(frame["image"], self.target_resolution).unsqueeze(0).to(self.device)
-            v_mask = resize_mask(frame["mask"], self.target_resolution).to(self.device)
+            img = frame["image"]
+            mask = frame["mask"]
+            K_in = frame.get("K")
+
+            if crop_coords is not None:
+                img_proc = img[y0:y1, x0:x1]
+                mask_proc = mask[y0:y1, x0:x1] if mask is not None else np.ones((proc_h, proc_w), dtype=bool)
+                if K_in is not None:
+                    K_proc = K_in.copy()
+                    K_proc[0, 2] -= x0
+                    K_proc[1, 2] -= y0
+                else:
+                    K_proc = None
+            else:
+                img_proc = img
+                mask_proc = mask
+                K_proc = K_in
+
+            img_norm = normalize_image(img_proc, self.target_resolution).unsqueeze(0).to(self.device)
+            v_mask = resize_mask(mask_proc, self.target_resolution).to(self.device)
             
             view_dict = {
                 "img": img_norm,
@@ -268,13 +388,11 @@ class Any4DMultiViewEngine:
             }
 
             if self.use_known_poses and frame.get("extrin") is not None:
-                # extrin is T_CW (Camera-from-World)
-                # Any4D expects T_WC (Camera-to-World)
                 T_WC = np.linalg.inv(frame["extrin"])
                 view_dict["camera_poses"] = torch.from_numpy(T_WC).float().unsqueeze(0).to(self.device)
 
-            if frame.get("K") is not None:
-                K_scaled = scale_intrinsics(frame["K"], (orig_h, orig_w), self.target_resolution)
+            if K_proc is not None:
+                K_scaled = scale_intrinsics(K_proc, (proc_h, proc_w), self.target_resolution)
                 view_dict["intrinsics"] = torch.from_numpy(K_scaled).float().unsqueeze(0).to(self.device)
 
             views.append(view_dict)
@@ -303,7 +421,12 @@ class Any4DMultiViewEngine:
         else:
             depth_z_model = np.ones((tH, tW), dtype=np.float32)
 
-        depth_z_full = cv2.resize(depth_z_model, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        if crop_coords is not None:
+            depth_crop = cv2.resize(depth_z_model, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+            depth_z_full = np.ones((orig_h, orig_w), dtype=np.float32) * float(np.median(depth_crop))
+            depth_z_full[y0:y1, x0:x1] = depth_crop
+        else:
+            depth_z_full = cv2.resize(depth_z_model, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
 
         # 2. 3D Scene Flow & Object Tracking (Ref -> Target)
         ref_pred = pred_result["pred1"]
@@ -316,8 +439,9 @@ class Any4DMultiViewEngine:
 
         pts3d_cur = pts3d_ref + scene_flow_t  # (tH, tW, 3)
 
-        # Object pixels selection
-        ref_mask = self.ref_mask_resized.cpu()
+        # Object pixels selection from current anchor
+        ref_mask_crop = window_frames[0]["mask"][y0:y1, x0:x1] if crop_coords is not None else window_frames[0]["mask"]
+        ref_mask = resize_mask(ref_mask_crop, self.target_resolution).cpu()
         sel = ref_mask
         if sel.sum() < self.min_mask_pts:
             return depth_z_full, None, None, None
@@ -332,18 +456,24 @@ class Any4DMultiViewEngine:
 
         # Object motion in world: T_WO_t = T_rel @ T_WO_ref
         curr_extrin = window_frames[-1]["extrin"]
-        T_WO_ref = self.ref_frame.get("T_WO_gt")
-        if T_WO_ref is None:
-            T_WO_ref = np.eye(4)
-
+        T_WO_ref = window_frames[0].get("T_WO_gt", np.eye(4))
         T_WO_est = T_rel @ T_WO_ref
 
-        # Temporal jump check against last valid estimate (max 20cm per frame)
-        if getattr(self, "last_valid_T_WO", None) is not None:
-            delta_t = np.linalg.norm(T_WO_est[:3, 3] - self.last_valid_T_WO[:3, 3])
-            if delta_t > 0.20:
-                # Suspect jump, do not return pose
-                return depth_z_full, None, None, None
+        # Temporal jump check against last valid estimate (max 35cm per frame)
+        prior_ref = T_WO_prior if T_WO_prior is not None else getattr(self, "last_valid_T_WO", None)
+        if prior_ref is not None:
+            delta_t = np.linalg.norm(T_WO_est[:3, 3] - prior_ref[:3, 3])
+            if delta_t > 0.35:
+                self.consecutive_jumps = getattr(self, "consecutive_jumps", 0) + 1
+                if self.consecutive_jumps < 2:
+                    return depth_z_full, None, None, None
+                else:
+                    self.consecutive_jumps = 0
+            else:
+                self.consecutive_jumps = 0
+        else:
+            self.consecutive_jumps = 0
+
         self.last_valid_T_WO = T_WO_est
         T_CO_est = curr_extrin @ T_WO_est
 

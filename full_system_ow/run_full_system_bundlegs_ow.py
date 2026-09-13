@@ -452,7 +452,8 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         any4d_hint = None
         if any4d_engine is not None and idx > cfg.init_frame:
             depth_a4d, T_CO_a4d, pts3d_a4d, pts2d_a4d = any4d_engine.process_frame(
-                idx, fd["image"], fd["mask"], fd["extrin"], fd["K"]
+                idx, fd["image"], fd["mask"], fd["extrin"], fd["K"],
+                T_WO_prior=getattr(tracker, "T_WO", None)
             )
             any4d_hint = (T_CO_a4d, pts3d_a4d, pts2d_a4d)
             if cfg.any4d_replace_depth and depth_a4d is not None:
@@ -469,6 +470,14 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         )
         if res is None: continue
         T_CO_est, img_fg_pkg = res
+
+        # Register new keyframe anchor in Any4D only if frame was tracked with high confidence
+        if (any4d_engine is not None and idx in tracker.keyframes 
+            and getattr(tracker, "last_pnp_success", False) 
+            and getattr(tracker, "last_n_inliers", 0) >= 40):
+            any4d_engine.try_add_anchor(
+                idx, fd["image"], fd["mask"], fd["extrin"], fd["K"], tracker.T_WO
+            )
         if isinstance(img_fg_pkg, (list, tuple)) and len(img_fg_pkg) == 2:
             img_fg_torch, alpha_fg_torch = img_fg_pkg
         elif isinstance(img_fg_pkg, torch.Tensor):

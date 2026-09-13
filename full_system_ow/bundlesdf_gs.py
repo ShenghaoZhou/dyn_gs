@@ -386,8 +386,18 @@ class BundleSdfGS:
                         T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
                 else:
                     T_guess_rel = V @ T_prev_rel
+                    # Guard constant velocity with Any4D 3D scene flow prior
+                    if any4d_hint is not None and any4d_hint[0] is not None:
+                        T_a4d_rel = any4d_hint[0] @ np.linalg.inv(self.poses[0])
+                        cv_a4d_diff = np.linalg.norm(T_guess_rel[:3, 3] - T_a4d_rel[:3, 3])
+                        if cv_a4d_diff > 0.08:
+                            print(f"[BundleSdfGS] CV diverged from Any4D by {cv_a4d_diff:.3f}m. Using Any4D motion prior.")
+                            T_guess_rel = T_a4d_rel
             else:
-                T_guess_rel = self.tracker.poses[self.cnt-1].copy()
+                if any4d_hint is not None and any4d_hint[0] is not None:
+                    T_guess_rel = any4d_hint[0] @ np.linalg.inv(self.poses[0])
+                else:
+                    T_guess_rel = self.tracker.poses[self.cnt-1].copy()
 
             # Stage 1: Photometric Initialization / Refinement
             use_photometric = self.tracker_cfg.use_photometric_refinement and (self.cnt < self.tracker_cfg.n_init_frames or self.gs_ready)
@@ -456,9 +466,17 @@ class BundleSdfGS:
                 diff_t = np.linalg.norm(T_guess_new[:3, 3] - T_guess_rel[:3, 3])
                 diff_R = np.rad2deg(np.arccos(np.clip((np.trace(T_guess_new[:3, :3] @ T_guess_rel[:3, :3].T) - 1) / 2, -1, 1)))
                 
-                if diff_t > 0.5 or diff_R > 20.0:
-                    pass
-                else:
+                # Check against Any4D if present to prevent photometric drift
+                reject_photo = (diff_t > 0.5 or diff_R > 20.0)
+                if not reject_photo and any4d_hint is not None and any4d_hint[0] is not None:
+                    T_a4d_rel = any4d_hint[0] @ np.linalg.inv(self.poses[0])
+                    diff_a4d_t = np.linalg.norm(T_guess_new[:3, 3] - T_a4d_rel[:3, 3])
+                    diff_a4d_R = np.rad2deg(np.arccos(np.clip((np.trace(T_guess_new[:3, :3] @ T_a4d_rel[:3, :3].T) - 1) / 2, -1, 1)))
+                    if diff_a4d_t > 0.08 or diff_a4d_R > 12.0:
+                        print(f"[BundleSdfGS] Rejecting photometric refinement: drifted {diff_a4d_t:.3f}m, {diff_a4d_R:.1f}deg from Any4D")
+                        reject_photo = True
+
+                if not reject_photo:
                     print(f"[BundleSdfGS] Photometric refinement adjusted guess: {diff_t:.6f}m, {diff_R:.6f}deg")
                     T_guess_rel = T_guess_new
                 
@@ -471,6 +489,8 @@ class BundleSdfGS:
             t0_geo = time.perf_counter()
             success, n_inliers = self.tracker.step_informed_with_occlusion(self.cnt, color, mask, depth, K, T_guess, flow_prev_curr=flow)
             self.timings["Geometric Tracking"].append(time.perf_counter() - t0_geo)
+            self.last_pnp_success = success
+            self.last_n_inliers = n_inliers
             
             jump = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
             max_jump = 1.0 if n_inliers < 50 else 2.0
@@ -485,16 +505,18 @@ class BundleSdfGS:
                     T_rel_a4d = T_CO_a4d @ np.linalg.inv(self.poses[0])
                     self.poses[self.cnt] = T_CO_a4d
                     self.tracker.poses[self.cnt] = T_rel_a4d
-                    if len(self.tracker.tracks) < 300:
+                    n_active_tracks = sum(1 for t in self.tracker.tracks.values() if self.cnt in t['obs'])
+                    if n_active_tracks < 120:
                         self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, T_rel_a4d, align=False)
                 elif not success:
-                    self.poses[self.cnt] = T_guess
                     self.tracker.poses[self.cnt] = T_guess
+                    self.poses[self.cnt] = T_guess @ self.poses[0]
                 else:
-                    self.poses[self.cnt] = self.tracker.poses[self.cnt]
+                    self.poses[self.cnt] = self.tracker.poses[self.cnt] @ self.poses[0]
             else:
-                self.poses[self.cnt] = self.tracker.poses[self.cnt]
-                if len(self.tracker.tracks) < 300:
+                self.poses[self.cnt] = self.tracker.poses[self.cnt] @ self.poses[0]
+                n_active_tracks = sum(1 for t in self.tracker.tracks.values() if self.cnt in t['obs'])
+                if n_active_tracks < 120:
                     self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, self.tracker.poses[self.cnt], align=True)
             
             # Sync final pose back to obj_gs for rendering and future frames
