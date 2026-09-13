@@ -127,6 +127,13 @@ class GlobalConfig:
     show_features: bool = True
     save_rrd: str = ""
 
+    # Any4D Multi-view Tracking and Metric Depth
+    use_any4d: bool = False
+    any4d_checkpoint: str = "Any4D/checkpoints/any4d_4v_combined.pth"
+    any4d_window_size: int = 4
+    any4d_use_known_poses: bool = True
+    any4d_replace_depth: bool = True
+
 def draw_tracks(image, tracks, frame_idx, tail_length=5):
     """Draws feature tracks on the image."""
     out = image.copy()
@@ -338,6 +345,27 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
     
     color_f0 = f0["image"]
     depth_f0 = f0["depth"]
+
+    any4d_engine = None
+    if cfg.use_any4d:
+        from any4d_multiview_engine import Any4DMultiViewEngine
+        any4d_engine = Any4DMultiViewEngine(
+            checkpoint_path=cfg.any4d_checkpoint,
+            window_size=cfg.any4d_window_size,
+            use_known_poses=cfg.any4d_use_known_poses,
+            device=cfg.device
+        )
+        mask_raw = f0.get("mask")
+        if mask_raw is None:
+            mask_raw = np.ones(f0["image"].shape[:2], dtype=np.uint8)
+        depth_a4d_0 = any4d_engine.set_reference_frame(
+            f0["image"], mask_raw, f0["extrin"], f0["K"], f0.get("T_WO_gt")
+        )
+        if cfg.any4d_replace_depth:
+            print("[Dynamic Worker] Using Any4D metric depth for initial frame.")
+            depth_f0 = depth_a4d_0
+            f0["depth"] = depth_a4d_0
+
     if depth_f0 is None:
         print(f"[Dynamic Worker] Error: No depth found for frame {f0['frame_idx']}, cannot initialize GS.")
         return
@@ -420,13 +448,24 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         T_CW_gt = fd["extrin"]
         T_CO_gt = T_CW_gt @ T_WO_gt if T_WO_gt is not None else None
         
+        # Any4D multi-view tracking and depth update
+        any4d_hint = None
+        if any4d_engine is not None and idx > cfg.init_frame:
+            depth_a4d, T_CO_a4d, pts3d_a4d, pts2d_a4d = any4d_engine.process_frame(
+                idx, fd["image"], fd["mask"], fd["extrin"], fd["K"]
+            )
+            any4d_hint = (T_CO_a4d, pts3d_a4d, pts2d_a4d)
+            if cfg.any4d_replace_depth and depth_a4d is not None:
+                fd["depth"] = depth_a4d
+
         # Run BundleSdfGS
         # Returns T_CiO (Camera-from-Object) and optionally a render
         res = tracker.run(
             fd["image"], fd["mask"], fd["depth"], fd["K"], 
             T_CW=fd["extrin"],
             T_WO_init=T_WO_gt if idx == cfg.init_frame else None,
-            return_render=True
+            return_render=True,
+            any4d_hint=any4d_hint
         )
         if res is None: continue
         T_CO_est, img_fg_pkg = res

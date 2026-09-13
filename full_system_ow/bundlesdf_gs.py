@@ -324,11 +324,12 @@ class BundleSdfGS:
             )
         return (img, alpha)
 
-    def run(self, color, mask, depth, K, T_CW=None, T_WO_init=None, return_render=False):
+    def run(self, color, mask, depth, K, T_CW=None, T_WO_init=None, return_render=False, any4d_hint=None):
         """
-        Main tracking loop. Now supports T_OW parameterization.
+        Main tracking loop. Now supports T_OW parameterization and Any4D multi-view hint.
         T_CW: Camera-from-World (extrinsics)
         T_WO_init: Object-in-World at start
+        any4d_hint: Optional tuple (T_CO_any4d, pts3d_any4d, pts2d_any4d)
         """
         t_start = time.perf_counter()
         self.cnt += 1
@@ -375,13 +376,14 @@ class BundleSdfGS:
                 v_t = np.linalg.norm(V[:3, 3])
                 v_R = np.rad2deg(np.arccos(np.clip((np.trace(V[:3, :3]) - 1) / 2, -1, 1)))
                 if v_t > 0.5 or v_R > 20.0:
-                    print(f"[BundleSdfGS] High velocity detected: {v_t:.4f}m, {v_R:.2f}deg. Discarding motion model and using last T_OW.")
-                    # Reset velocity estimation for future frames by aligning pprev with prev
+                    print(f"[BundleSdfGS] High velocity detected: {v_t:.4f}m, {v_R:.2f}deg. Discarding motion model.")
                     self.tracker.poses[self.cnt-2] = self.tracker.poses[self.cnt-1].copy()
-                    
-                    # Discard motion model prediction and use last T_OW (assume stationary in world)
-                    T_guess_CiO = self.T_CW @ self.T_WO
-                    T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
+                    if any4d_hint is not None and any4d_hint[0] is not None:
+                        T_guess_CiO = any4d_hint[0]
+                        T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
+                    else:
+                        T_guess_CiO = self.T_CW @ self.T_WO
+                        T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
                 else:
                     T_guess_rel = V @ T_prev_rel
             else:
@@ -391,22 +393,17 @@ class BundleSdfGS:
             use_photometric = self.tracker_cfg.use_photometric_refinement and (self.cnt < self.tracker_cfg.n_init_frames or self.gs_ready)
             
             if use_photometric and self.obj_gs is not None and self.obj_gs.gs_params is not None:
-                # Ensure tracker uses up-to-date GS model (mapper is used in sync mode, obj_gs in multi-proc)
                 if not self.use_multiprocessing and self.mapper is not None:
                     self.obj_gs.gs_params = self.mapper.gs_params
                 
                 t0_photo = time.perf_counter()
-                # The object is parameterized as T_WO (Object in World)
-                # We optimize for T_WO directly.
-                # We optimize for T_WO directly.
-                
-                # T_WO_guess is current self.T_WO (updated from last frame's velocity if available)
                 if self.cnt > 1:
-                    # Update T_WO_guess using velocity in World Frame if possible, 
-                    # but BundleSdfGS uses relative camera motion usually.
-                    # Here we keep it simple and use T_guess_rel @ self.poses[0] @ inv(T_CW)
-                    T_CO_guess = T_guess_rel @ self.poses[0]
-                    T_WO_guess = np.linalg.inv(self.T_CW) @ T_CO_guess
+                    if any4d_hint is not None and any4d_hint[0] is not None:
+                        T_CO_guess = any4d_hint[0]
+                        T_WO_guess = np.linalg.inv(self.T_CW) @ T_CO_guess
+                    else:
+                        T_CO_guess = T_guess_rel @ self.poses[0]
+                        T_WO_guess = np.linalg.inv(self.T_CW) @ T_CO_guess
                 else:
                     T_WO_guess = self.T_WO
                 
@@ -456,14 +453,10 @@ class BundleSdfGS:
                 T_CiO_refined = self.T_CW @ T_WO_refined
                 T_guess_new = T_CiO_refined @ np.linalg.inv(self.poses[0])
 
-                
-                diff_t = np.linalg.norm(T_guess_new[:3, 3] - T_guess_rel[:3, 3])
-                # Safety check: reject if photometric refinement moved too much
                 diff_t = np.linalg.norm(T_guess_new[:3, 3] - T_guess_rel[:3, 3])
                 diff_R = np.rad2deg(np.arccos(np.clip((np.trace(T_guess_new[:3, :3] @ T_guess_rel[:3, :3].T) - 1) / 2, -1, 1)))
                 
                 if diff_t > 0.5 or diff_R > 20.0:
-                    # Silent rejection
                     pass
                 else:
                     print(f"[BundleSdfGS] Photometric refinement adjusted guess: {diff_t:.6f}m, {diff_R:.6f}deg")
@@ -480,20 +473,27 @@ class BundleSdfGS:
             self.timings["Geometric Tracking"].append(time.perf_counter() - t0_geo)
             
             jump = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
-            # Relaxed jump threshold if inliers are high
             max_jump = 1.0 if n_inliers < 50 else 2.0
             if not success or n_inliers < self.tracker_cfg.min_pnp_inliers or jump > max_jump:
                 if success and jump > max_jump:
                     print(f"[GeoTracker] Rejecting PnP (jump: {jump:.4f}m > {max_jump}m)")
-                # If PnP failed, we use the guess but DON'T add points yet as the pose is suspect
-                if not success:
+                
+                # Any4D Fallback check
+                if any4d_hint is not None and any4d_hint[0] is not None:
+                    T_CO_a4d = any4d_hint[0]
+                    print(f"[BundleSdfGS] Recovering with Any4D multi-view pose at frame {self.cnt} (PnP inliers: {n_inliers})")
+                    T_rel_a4d = T_CO_a4d @ np.linalg.inv(self.poses[0])
+                    self.poses[self.cnt] = T_CO_a4d
+                    self.tracker.poses[self.cnt] = T_rel_a4d
+                    if len(self.tracker.tracks) < 300:
+                        self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, T_rel_a4d, align=False)
+                elif not success:
                     self.poses[self.cnt] = T_guess
                     self.tracker.poses[self.cnt] = T_guess
                 else:
                     self.poses[self.cnt] = self.tracker.poses[self.cnt]
             else:
                 self.poses[self.cnt] = self.tracker.poses[self.cnt]
-                # If we are low on points AND PnP was successful, add more
                 if len(self.tracker.tracks) < 300:
                     self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, self.tracker.poses[self.cnt], align=True)
             
