@@ -33,7 +33,8 @@ class GeoTrackerConfig:
     feature_type: str = "orb" # "loftr", "superpoint", "orb", "grid"
     n_features: int = 2000 # Increased for better robustness
     min_pnp_inliers: int = 20
-    max_pose_jump: float = 10.0 # Effectively disable rejection to match benchmark
+    max_pose_jump: float = 0.25 # Tightened threshold (was 10.0)
+    max_rot_jump: float = 20.0 # Max allowed orientation jump in degrees
     use_photometric_refinement: bool = True
     n_init_frames: int = 10 # Number of frames for photometric initialization
     
@@ -63,6 +64,47 @@ class GeoTrackerConfig:
     photometric_mode: str = "lm" # "hybrid", "adam", or "lm"
     use_match_projections: bool = False
     debug: bool = False
+
+    # ARAP 2D-to-3D Flow Lifting
+    use_arap_flow_lifting: bool = True
+    arap_strain_thresh: float = 0.15
+    arap_k_neighbors: int = 8
+    arap_lambda: float = 5.0
+    arap_opt_steps: int = 25
+
+
+def se3_log(T):
+    """SE(3) → ℝ⁶ (translation + axis-angle). Used for EMA velocity smoothing."""
+    t = T[:3, 3]
+    R_mat = T[:3, :3]
+    cos_angle = np.clip((np.trace(R_mat) - 1) / 2, -1, 1)
+    angle = np.arccos(cos_angle)
+    if angle < 1e-6:
+        omega = np.zeros(3)
+    else:
+        omega = angle / (2 * np.sin(angle)) * np.array([
+            R_mat[2, 1] - R_mat[1, 2],
+            R_mat[0, 2] - R_mat[2, 0],
+            R_mat[1, 0] - R_mat[0, 1]
+        ])
+    return np.concatenate([t, omega])
+
+def se3_exp(v):
+    """ℝ⁶ → SE(3). Inverse of se3_log."""
+    t, omega = v[:3], v[3:]
+    angle = np.linalg.norm(omega)
+    T = np.eye(4)
+    if angle < 1e-6:
+        T[:3, :3] = np.eye(3)
+    else:
+        axis = omega / angle
+        K_skew = np.array([[0, -axis[2], axis[1]],
+                            [axis[2], 0, -axis[0]],
+                            [-axis[1], axis[0], 0]])
+        T[:3, :3] = np.eye(3) + np.sin(angle) * K_skew + (1 - np.cos(angle)) * K_skew @ K_skew
+    T[:3, 3] = t
+    return T
+
 
 class BundleSdfGS:
     def __init__(self, tracker_cfg: GeoTrackerConfig, cfg_mapping: MappingConfig, use_multiprocessing: bool = True, initial_gs: GSParam = None):
@@ -105,6 +147,13 @@ class BundleSdfGS:
         self.prev_gray = None
         self.prev_mask = None
         
+        # Velocity EMA smoothing state (Fix 1 & Fix 3)
+        self.velocity_ema = np.zeros(6)       # Smoothed velocity in se(3): [tx, ty, tz, rx, ry, rz]
+        self.ema_alpha = 0.4                   # EMA weight for new observation (lower = more inertia)
+        self.velocity_history = []             # Recent raw velocities for MAD outlier gating
+        self.velocity_ema_initialized = False  # Whether EMA has been seeded
+        self.T_WO_history = {}                 # History of object poses in world coordinates
+        
     @property
     def mapper_last_finished_frame(self):
         return self.p_dict.get('last_finished_frame', -1)
@@ -131,9 +180,11 @@ class BundleSdfGS:
                             )
                             self.obj_gs.update_reference(img_ref, self.obj_gs.T_C_O_ref, alpha_ref)
                 
-                # Update geometric tracker's 3D points from the optimized GS means
-                new_points = self.obj_gs.gs_params.means.detach().cpu().numpy()
-                self.tracker.update_object_points(new_points)
+                # Update geometric tracker's 3D points from the optimized GS means (transformed to Camera 0 frame)
+                new_points_O = self.obj_gs.gs_params.means.detach().cpu().numpy()
+                T_C0O = self.poses[0] if (hasattr(self, 'poses') and 0 in self.poses) else getattr(self, "T_C0O_anchor", np.eye(4))
+                new_points_C0 = (new_points_O @ T_C0O[:3, :3].T) + T_C0O[:3, 3]
+                self.tracker.update_object_points(new_points_C0)
 
     def print_timings(self):
         print("\n" + "-"*30)
@@ -348,6 +399,7 @@ class BundleSdfGS:
             self.tracker.keyframes.append(0)
             self.init_gs_model(color, depth, mask, K, self.T_WO, self.T_CW, pre_initialized_gs=self.initial_gs_param)
             self.poses[0] = T_C0O_init
+            self.T_WO_history[0] = self.T_WO.copy()
             self.prev_mask = mask.copy()
             self.prev_depth = depth.copy()
             self.prev_color = color.copy()
@@ -369,35 +421,60 @@ class BundleSdfGS:
             self.timings["Pre-processing (Flow)"].append(time.perf_counter() - t0)
 
             if self.cnt > 1:
-                T_pprev_rel = self.tracker.poses[self.cnt-2]
-                T_prev_rel = self.tracker.poses[self.cnt-1]
-                V = T_prev_rel @ np.linalg.inv(T_pprev_rel)
+                # Disentangle object motion from camera ego-motion by computing velocity in world frame
+                T_WO_prev = self.T_WO_history.get(self.cnt - 1, self.T_WO)
+                T_WO_pprev = self.T_WO_history.get(self.cnt - 2, T_WO_prev)
+                V_WO_raw = T_WO_prev @ np.linalg.inv(T_WO_pprev)
                 
-                v_t = np.linalg.norm(V[:3, 3])
-                v_R = np.rad2deg(np.arccos(np.clip((np.trace(V[:3, :3]) - 1) / 2, -1, 1)))
-                if v_t > 0.5 or v_R > 20.0:
-                    print(f"[BundleSdfGS] High velocity detected: {v_t:.4f}m, {v_R:.2f}deg. Discarding motion model.")
-                    self.tracker.poses[self.cnt-2] = self.tracker.poses[self.cnt-1].copy()
-                    if any4d_hint is not None and any4d_hint[0] is not None:
-                        T_guess_CiO = any4d_hint[0]
-                        T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
-                    else:
-                        T_guess_CiO = self.T_CW @ self.T_WO
-                        T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
+                # Convert to se(3) tangent space: [tx, ty, tz, rx, ry, rz]
+                v_raw = se3_log(V_WO_raw)
+                v_t = np.linalg.norm(v_raw[:3])
+                v_R = np.rad2deg(np.linalg.norm(v_raw[3:]))
+                
+                # MAD Outlier Gate across recent velocity history
+                if len(self.velocity_history) >= 3:
+                    v_hist_arr = np.array(self.velocity_history[-5:])
+                    v_median = np.median(v_hist_arr, axis=0)
+                    v_mad = np.median(np.abs(v_hist_arr - v_median), axis=0)
+                    v_mad = np.maximum(v_mad, 1e-4)
+                    z_score = np.abs(v_raw - v_median) / (1.4826 * v_mad)
+                    if np.max(z_score) > 3.0 or v_t > 0.35 or v_R > 25.0:
+                        print(f"[BundleSdfGS] Outlier velocity detected (vt: {v_t:.4f}m, vR: {v_R:.2f}deg, z: {np.max(z_score):.1f}). Damping with median.")
+                        v_raw = v_median
+                elif v_t > 0.35 or v_R > 25.0:
+                    print(f"[BundleSdfGS] High velocity detected (vt: {v_t:.4f}m, vR: {v_R:.2f}deg). Clamping.")
+                    scale_t = min(1.0, 0.20 / (v_t + 1e-6))
+                    scale_R = min(1.0, np.deg2rad(15.0) / (np.linalg.norm(v_raw[3:]) + 1e-6))
+                    v_raw[:3] *= scale_t
+                    v_raw[3:] *= scale_R
+
+                # EMA update
+                if not self.velocity_ema_initialized:
+                    self.velocity_ema = v_raw.copy()
+                    self.velocity_ema_initialized = True
                 else:
-                    T_guess_rel = V @ T_prev_rel
-                    # Guard constant velocity with Any4D 3D scene flow prior
-                    if any4d_hint is not None and any4d_hint[0] is not None:
-                        T_a4d_rel = any4d_hint[0] @ np.linalg.inv(self.poses[0])
-                        cv_a4d_diff = np.linalg.norm(T_guess_rel[:3, 3] - T_a4d_rel[:3, 3])
-                        if cv_a4d_diff > 0.08:
-                            print(f"[BundleSdfGS] CV diverged from Any4D by {cv_a4d_diff:.3f}m. Using Any4D motion prior.")
-                            T_guess_rel = T_a4d_rel
-            else:
+                    self.velocity_ema = self.ema_alpha * v_raw + (1.0 - self.ema_alpha) * self.velocity_ema
+                
+                self.velocity_history.append(v_raw.copy())
+                if len(self.velocity_history) > 20:
+                    self.velocity_history.pop(0)
+                    
+                V_WO_smooth = se3_exp(self.velocity_ema)
+                T_WO_guess = V_WO_smooth @ T_WO_prev
+                T_guess_CiO = self.T_CW @ T_WO_guess
+                T_guess_rel = T_guess_CiO @ np.linalg.inv(self.poses[0])
+                
+                # Guard constant velocity with Any4D 3D scene flow prior
                 if any4d_hint is not None and any4d_hint[0] is not None:
-                    T_guess_rel = any4d_hint[0] @ np.linalg.inv(self.poses[0])
-                else:
-                    T_guess_rel = self.tracker.poses[self.cnt-1].copy()
+                    T_a4d_rel = any4d_hint[0] @ np.linalg.inv(self.poses[0])
+                    cv_a4d_diff = np.linalg.norm(T_guess_rel[:3, 3] - T_a4d_rel[:3, 3])
+                    speed = np.linalg.norm(self.velocity_ema[:3])
+                    adaptive_a4d_thresh = float(np.clip(2.0 * speed, 0.04, 0.12))
+                    if cv_a4d_diff > adaptive_a4d_thresh:
+                        print(f"[BundleSdfGS] CV diverged from Any4D by {cv_a4d_diff:.3f}m (thresh {adaptive_a4d_thresh:.3f}m). Using Any4D motion prior.")
+                        T_guess_rel = T_a4d_rel
+            else:
+                T_guess_rel = self.tracker.poses[self.cnt-1].copy()
 
             # Stage 1: Photometric Initialization / Refinement
             use_photometric = self.tracker_cfg.use_photometric_refinement and (self.cnt < self.tracker_cfg.n_init_frames or self.gs_ready)
@@ -492,11 +569,16 @@ class BundleSdfGS:
             self.last_pnp_success = success
             self.last_n_inliers = n_inliers
             
-            jump = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
-            max_jump = 1.0 if n_inliers < 50 else 2.0
-            if not success or n_inliers < self.tracker_cfg.min_pnp_inliers or jump > max_jump:
-                if success and jump > max_jump:
-                    print(f"[GeoTracker] Rejecting PnP (jump: {jump:.4f}m > {max_jump}m)")
+            jump_t = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
+            R_diff = self.tracker.poses[self.cnt][:3, :3] @ T_guess[:3, :3].T
+            jump_R = np.rad2deg(np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1)))
+            max_jump_t = 0.20 if n_inliers < 50 else 0.35
+            max_jump_R = 20.0
+            
+            is_jump = (jump_t > max_jump_t) or (jump_R > max_jump_R)
+            if not success or n_inliers < self.tracker_cfg.min_pnp_inliers or is_jump:
+                if success and is_jump:
+                    print(f"[GeoTracker] Rejecting PnP (jump_t: {jump_t:.4f}m > {max_jump_t}m, jump_R: {jump_R:.2f}deg > {max_jump_R}deg)")
                 
                 # Any4D Fallback check
                 if any4d_hint is not None and any4d_hint[0] is not None:
@@ -505,18 +587,18 @@ class BundleSdfGS:
                     T_rel_a4d = T_CO_a4d @ np.linalg.inv(self.poses[0])
                     self.poses[self.cnt] = T_CO_a4d
                     self.tracker.poses[self.cnt] = T_rel_a4d
-                elif not success:
-                    self.tracker.poses[self.cnt] = T_guess
-                    self.poses[self.cnt] = T_guess @ self.poses[0]
                 else:
-                    self.poses[self.cnt] = self.tracker.poses[self.cnt] @ self.poses[0]
+                    # Fix 0a: Strictly revert to guess on failure or rejection
+                    self.tracker.poses[self.cnt] = T_guess.copy()
+                    self.poses[self.cnt] = T_guess @ self.poses[0]
             else:
                 self.poses[self.cnt] = self.tracker.poses[self.cnt] @ self.poses[0]
             
             # Sync final pose back to obj_gs for rendering and future frames
+            self.T_WO = np.linalg.inv(self.T_CW) @ self.poses[self.cnt]
             if self.obj_gs is not None:
-                self.T_WO = np.linalg.inv(self.T_CW) @ self.poses[self.cnt]
                 self.obj_gs.T_W_O = self.T_WO
+            self.T_WO_history[self.cnt] = self.T_WO.copy()
             
         # Keyframe Logic
         is_kf = False
@@ -616,9 +698,11 @@ class BundleSdfGS:
                     )
                     self.obj_gs.update_reference(img_ref, self.obj_gs.T_C_O_ref, alpha_ref)
             
-            # Update geometric tracker's 3D points
-            new_points = self.obj_gs.gs_params.means.detach().cpu().numpy()
-            self.tracker.update_object_points(new_points)
+            # Update geometric tracker's 3D points (transformed to Camera 0 frame)
+            new_points_O = self.obj_gs.gs_params.means.detach().cpu().numpy()
+            T_C0O = self.poses[0] if (hasattr(self, 'poses') and 0 in self.poses) else getattr(self, "T_C0O_anchor", np.eye(4))
+            new_points_C0 = (new_points_O @ T_C0O[:3, :3].T) + T_C0O[:3, 3]
+            self.tracker.update_object_points(new_points_C0)
 
     def run_ba_python(self):
         if len(self.keyframes) < 2: return

@@ -18,12 +18,13 @@ from gs_dyn_obj.utils.init import unproject_depth, d2n_tblr
 from gs_dyn_obj.gs_rendering import render_2dgs
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply, quaternion_to_matrix
 
+from gs_dyn_obj.arap import build_knn_graph, compute_arap_loss, compute_rotation_consistency_loss
 from run_single_view_loss import compute_single_view_loss
 from run_multi_view_loss import compute_multi_view_loss
 
 # Import PGSR-style loss utilities
 import sys
-sys.path.append(str(Path(__file__).parent / "third_party" / "PGSR"))
+sys.path.insert(0, str(Path(__file__).parent / "third_party" / "PGSR"))
 from utils.loss_utils import ssim, lncc, get_img_grad_weight
 
 @dataclass
@@ -59,6 +60,7 @@ class MappingConfig:
     multi_view_patch_size: int = 3
     
     densify_every: int = 5
+    prune_every: int = 1
     prune_opacity_th: float = 0.01
     prune_screen_size_th: float = 100.0
     
@@ -76,6 +78,15 @@ class MappingConfig:
     multi_view_max_dis: float = 0.1
     
     use_ray_dist: bool = True
+    align_depth: bool = False
+    align_with_bias: bool = True
+    
+    # ARAP Rigidity Regularization
+    use_arap: bool = True
+    arap_weight: float = 0.1
+    arap_rot_weight: float = 0.05
+    arap_k: int = 8
+    arap_warmup_steps: int = 30
 
 class MiniCam:
     def __init__(self, K, extrin, width, height, ncc_scale=1.0):
@@ -221,34 +232,78 @@ def build_rotation_from_normal(normal):
 
 def init_gs_from_tracker_points(points, colors, device, normals=None, ray_o=None, ray_d=None, ray_dist=None, gs_type="2d"):
     num_pts = points.shape[0]
-    means = torch.from_numpy(points).float().to(device).requires_grad_(True)
-    colors_sh = RGB2SH(torch.from_numpy(colors).float().to(device)).requires_grad_(True)
+    means = torch.from_numpy(points).float().to(device)
+    colors_rgb = torch.from_numpy(colors).float().to(device)
+    colors_sh = RGB2SH(colors_rgb)
+    
+    # Store colors in logit space for the renderer
+    colors_logit = torch.logit(colors_rgb.clamp(1e-6, 1.0 - 1e-6))
+    
     if normals is not None:
-        quats = build_rotation_from_normal(torch.from_numpy(normals).float().to(device)).requires_grad_(True)
+        quats = build_rotation_from_normal(torch.from_numpy(normals).float().to(device))
     else:
         quats = torch.zeros((num_pts, 4), device=device); quats[:, 0] = 1.0
-        quats = quats.requires_grad_(True)
     
     if gs_type == "3d" or gs_type == "normal":
-        scales = (torch.ones((num_pts, 3), device=device) * 0.01).log().requires_grad_(True)
+        scales = (torch.ones((num_pts, 3), device=device) * 0.02).log()
     else:
-        scales = (torch.ones((num_pts, 2), device=device) * 0.01).log().requires_grad_(True)
-    opacity = torch.logit(torch.ones((num_pts, 1), device=device) * 0.7).requires_grad_(True)
+        scales = (torch.ones((num_pts, 2), device=device) * 0.02).log()
+        
+    opacity = torch.logit(torch.ones((num_pts, 1), device=device) * 0.7)
+    shs = colors_sh.unsqueeze(1).detach() if colors_sh.dim()==2 else colors_sh.detach()
     
     if ray_o is not None: ray_o = ray_o.to(device)
     if ray_d is not None: ray_d = ray_d.to(device)
     if ray_dist is not None: ray_dist = ray_dist.to(device)
         
-    return GSParam(means, quats, scales, colors_sh, opacity, ray_o, ray_d, ray_dist)
+    return GSParam(means=means.detach(), quats=quats.detach(), scales=scales.detach(), 
+                   colors=colors_logit.detach(), opacity=opacity.detach(), 
+                   shs=shs,
+                   ray_o=ray_o, ray_d=ray_d, ray_dist=ray_dist)
 
 class GSMapping:
-    def __init__(self, cfg: MappingConfig, initial_gs: GSParam):
+    def __init__(self, cfg: MappingConfig, initial_gs: GSParam, output_queue: Optional[mp.Queue] = None):
         self.cfg = cfg
         self.gs_params = initial_gs
         self.data_queue = mp.Queue(maxsize=1)
+        self.output_queue = output_queue
         self.stop_event = mp.Event()
-        self.last_finished_frame = -1
-        self.lock = threading.Lock()
+        self._lock = None
+        self.keyframes = []
+        self.device = torch.device(cfg.device)
+        self.gs_params.to(self.device)
+        
+        radius = 3
+        self.disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=self.device)
+        ky, kx = torch.meshgrid(torch.arange(-radius, radius + 1), torch.arange(-radius, radius + 1), indexing="ij")
+        self.disc_kernel[0, 0, torch.sqrt(kx**2 + ky**2) <= radius + 0.5] = 1
+        self.disc_kernel = self.disc_kernel / self.disc_kernel.sum()
+        
+        self.setup_optimizer()
+
+        # ARAP graph initialization
+        self.arap_edges = None
+        self.arap_ref_dists = None
+        if self.cfg.use_arap:
+            self._rebuild_arap_graph()
+
+    def _rebuild_arap_graph(self):
+        """Build or rebuild k-NN graph and cache reference distances for ARAP loss."""
+        if not self.cfg.use_arap:
+            return
+        with torch.no_grad():
+            curr_means = self.gs_params.means
+            if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                curr_means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
+            self.arap_edges, self.arap_ref_dists = build_knn_graph(
+                curr_means.detach(), k=self.cfg.arap_k
+            )
+
+    @property
+    def lock(self):
+        if self._lock is None:
+            self._lock = threading.Lock()
+        return self._lock
 
     def setup_optimizer(self):
         params = [
@@ -263,7 +318,10 @@ class GSMapping:
         if not self.cfg.fix_scale:
             params.append({"params": [self.gs_params.scales], "lr": self.cfg.lr_scales})
         if not self.cfg.fix_color:
-            params.append({"params": [self.gs_params.colors], "lr": self.cfg.lr_colors})
+            if self.gs_params.shs is not None:
+                params.append({"params": [self.gs_params.shs], "lr": self.cfg.lr_colors})
+            else:
+                params.append({"params": [self.gs_params.colors], "lr": self.cfg.lr_colors})
         
         self.optimizer = torch.optim.Adam(params)
 
@@ -339,9 +397,28 @@ class GSMapping:
                         print(f"Error in mapping loop: {e}")
                     continue
                 
-                self.optimize_frame(frame_data)
                 frame_count += 1
+                self.optimize_frame(frame_data, frame_count=frame_count)
                 self.last_finished_frame = frame_data["frame_idx"]
+                
+                # Send updated model back to tracking process
+                if self.output_queue is not None:
+                    with self.lock:
+                        # Passing as numpy to avoid any shared memory/tensor issues for now
+                        # but we could use shared memory tensors for more speed
+                        gs_data = {
+                            "means": self.gs_params.means.detach().cpu().numpy(),
+                            "quats": self.gs_params.quats.detach().cpu().numpy(),
+                            "scales": self.gs_params.scales.detach().cpu().numpy(),
+                            "colors": self.gs_params.colors.detach().cpu().numpy(),
+                            "opacity": self.gs_params.opacity.detach().cpu().numpy(),
+                            "shs": self.gs_params.shs.detach().cpu().numpy() if self.gs_params.shs is not None else None,
+                        }
+                        if self.output_queue.full():
+                            try: self.output_queue.get_nowait()
+                            except: pass
+                        self.output_queue.put(gs_data)
+
                 if frame_count % 5 == 0:
                     print(f"Mapping Progress: Processed {frame_count} frames. GS count: {len(self.gs_params.means)}")
         except KeyboardInterrupt:
@@ -362,16 +439,51 @@ class GSMapping:
     def densify(self, image_t, depth_np, mask_t, cam, T_CO_t):
         with torch.no_grad():
             render_mode = "3dgs" if self.cfg.gs_type == "3d" else "normal"
-            render_image, render_depth, _, _ = self.gs_params.render(T_CO_t, cam.K, cam.width, cam.height, mode=render_mode)
+            render_image, render_depth, _, render_alpha = self.gs_params.render(T_CO_t, cam.K, cam.width, cam.height, mode=render_mode)
             render_depth = render_depth.squeeze()
             depth_curr_t = torch.from_numpy(depth_np).float().to(self.device)
-            overlap_mask = (render_depth > 0) & (depth_curr_t > 0) & mask_t
-            # if overlap_mask.sum() > 100:
-            #     depth_curr_t *= torch.median(render_depth[overlap_mask] / depth_curr_t[overlap_mask])
+            
+            if getattr(self.cfg, "align_depth", False):
+                overlap_mask = (render_depth > 0) & (depth_curr_t > 0) & mask_t
+                if overlap_mask.sum() > 100:
+                    # ref = s * obs + b
+                    obs = depth_curr_t[overlap_mask].cpu().numpy()
+                    ref = render_depth[overlap_mask].cpu().numpy()
+                    
+                    # Robust filtering
+                    scales = ref / (obs + 1e-6)
+                    med = np.median(scales)
+                    valid = np.abs(scales - med) < 0.2 * med
+                    
+                    if np.sum(valid) > 50:
+                        if getattr(self.cfg, "align_with_bias", True):
+                            A = np.stack([obs[valid], np.ones_like(obs[valid])], axis=-1)
+                            B = ref[valid]
+                            res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+                            s, b = res[0], res[1]
+                        else:
+                            A = obs[valid][:, None]
+                            B = ref[valid]
+                            res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+                            s, b = res[0], 0.0
+                            
+                        # Clamp scale to reasonable range
+                        s = np.clip(s, 0.1, 10.0)
+                        depth_curr_t = s * depth_curr_t + b
+                        print(f"[Mapper] Depth Alignment: s={s:.4f}, b={b:.4f}")
+            # 1. Laplacian-based sampling (High frequency details)
             init_proba, penalty = get_lapla_norm(image_t, self.disc_kernel), get_lapla_norm(render_image, self.disc_kernel)
-            sample_mask = (torch.rand_like(init_proba) < (init_proba - penalty) * 4.0) & mask_t & (depth_curr_t > 0)
+            sample_mask = (torch.rand_like(init_proba) < (init_proba - penalty) * 15.0) & mask_t & (depth_curr_t > 0)
+            
+            # 2. Alpha-based sampling (Fill holes in the mask)
+            # If render_alpha is low but mask is present, we MUST add points
+            alpha_o = render_alpha.squeeze(0)
+            hole_mask = (alpha_o < 0.5) & mask_t & (depth_curr_t > 0)
+            sample_mask |= (hole_mask & (torch.rand_like(init_proba) < 0.5))
+            
+            # 3. Depth-gap sampling (New geometry or occlusions)
             depth_closer = (depth_curr_t < (render_depth - 0.01)) | (render_depth == 0)
-            sample_mask |= (depth_closer & mask_t & (depth_curr_t > 0) & (torch.rand_like(init_proba) < 0.2))
+            sample_mask |= (depth_closer & mask_t & (depth_curr_t > 0) & (torch.rand_like(init_proba) < 0.3))
             
             if sample_mask.sum() > 0:
                 y, x = torch.where(sample_mask)
@@ -410,7 +522,8 @@ class GSMapping:
                 new_colors = RGB2SH(image_t[:, y, x].permute(1, 0))
                 new_quats = build_rotation_from_normal(new_normals_o)
                 sampled_init_proba = init_proba[y, x].clamp_min(1e-6)
-                new_sizes = (1.0 / torch.sqrt(sampled_init_proba)).clamp(2.0, cam.width / 5.0) * (z / ((fx+fy)/2))
+                # Use a much smaller scale for new points (similar to initialization, ~1 pixel size)
+                new_sizes = (1.0 / torch.sqrt(sampled_init_proba)).clamp(0.2, 2.0) * (z / ((fx+fy)/2))
                 
                 if self.cfg.gs_type == "3d":
                     new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 3).clamp(1e-6, 1e6))
@@ -419,19 +532,27 @@ class GSMapping:
                 else:
                     new_scales = torch.log(new_sizes.view(-1, 1).repeat(1, 2).clamp(1e-6, 1e6))
                     
-                new_opacity = torch.logit(torch.ones((len(new_means), 1), device=self.device) * 0.1)
+                new_opacity = torch.logit(torch.ones((len(new_means), 1), device=self.device) * 0.3)
                     
                 new_means = new_means.requires_grad_(True)
                 new_quats = new_quats.requires_grad_(True)
-                new_scales = new_scales.requires_grad_(True)
-                new_colors = new_colors.requires_grad_(True)
+                new_scales = new_scales.requires_grad_(not self.cfg.fix_scale)
+                new_colors = new_colors.requires_grad_(not self.cfg.fix_color)
                 new_opacity = new_opacity.requires_grad_(True)
 
                 self.gs_params.means = torch.nn.Parameter(torch.cat([self.gs_params.means.data, new_means], dim=0))
                 self.gs_params.quats = torch.nn.Parameter(torch.cat([self.gs_params.quats.data, new_quats], dim=0))
                 self.gs_params.scales = torch.nn.Parameter(torch.cat([self.gs_params.scales.data, new_scales], dim=0))
-                self.gs_params.colors = torch.nn.Parameter(torch.cat([self.gs_params.colors.data, new_colors], dim=0))
+                
+                # Initialize colors in logit space for raw colors
+                new_colors_raw = image_t[:, y, x].permute(1, 0).clamp(1e-6, 1-1e-6)
+                new_colors_logit = torch.logit(new_colors_raw)
+                self.gs_params.colors = torch.nn.Parameter(torch.cat([self.gs_params.colors.data, new_colors_logit], dim=0))
                 self.gs_params.opacity = torch.nn.Parameter(torch.cat([self.gs_params.opacity.data, new_opacity], dim=0))
+                
+                if self.gs_params.shs is not None:
+                    if new_colors.dim() == 2: new_colors = new_colors.unsqueeze(1)
+                    self.gs_params.shs = torch.nn.Parameter(torch.cat([self.gs_params.shs.data, new_colors], dim=0))
                 
                 if self.gs_params.ray_o is not None:
                     # Initialize rays for new points
@@ -446,6 +567,8 @@ class GSMapping:
                         self.gs_params.ray_dist = torch.nn.Parameter(torch.cat([self.gs_params.ray_dist.data, new_ray_dist], dim=0))
 
                 self.setup_optimizer()
+                if self.cfg.use_arap:
+                    self._rebuild_arap_graph()
 
     def prune(self, T_CO_t, cam):
         with torch.no_grad():
@@ -463,6 +586,8 @@ class GSMapping:
             self.gs_params.scales = torch.nn.Parameter(self.gs_params.scales[valid_mask])
             self.gs_params.colors = torch.nn.Parameter(self.gs_params.colors[valid_mask])
             self.gs_params.opacity = torch.nn.Parameter(self.gs_params.opacity[valid_mask])
+            if self.gs_params.shs is not None:
+                self.gs_params.shs = torch.nn.Parameter(self.gs_params.shs[valid_mask])
             
             if self.gs_params.ray_dist is not None:
                 self.gs_params.ray_o = self.gs_params.ray_o[valid_mask]
@@ -471,7 +596,11 @@ class GSMapping:
                 
     def optimize_frame(self, frame_data, num_steps=None, frame_count=0):
         image, mask, depth = frame_data["image"], frame_data["mask"], frame_data["depth"]
-        K, T_CO = frame_data["K"], frame_data["T_CiO"]
+        K = frame_data["K"]
+        if "extrin" in frame_data and "T_WO" in frame_data:
+            T_CO = frame_data["extrin"] @ frame_data["T_WO"]
+        else:
+            T_CO = frame_data["T_CiO"]
         
         H, W = image.shape[:2]
         image_t = torch.from_numpy(image).float().to(self.device).permute(2, 0, 1) / 255.0
@@ -581,7 +710,26 @@ class GSMapping:
                                     if d_mask.any():
                                         loss_mv += self.cfg.multi_view_geo_weight * (weights * p_noise)[d_mask].mean() / len(selected_neighbors)
             
-            total_loss = loss_photo + loss_mask + self.cfg.lambda_sv * loss_sv + loss_mv
+            # ARAP Rigidity Regularization
+            loss_arap = torch.tensor(0.0, device=self.device)
+            loss_arap_rot = torch.tensor(0.0, device=self.device)
+            if self.cfg.use_arap and self.arap_edges is not None and step >= self.cfg.arap_warmup_steps:
+                curr_means = self.gs_params.means
+                if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                    curr_means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
+                
+                loss_arap = compute_arap_loss(curr_means, self.arap_edges, self.arap_ref_dists)
+                if self.cfg.arap_rot_weight > 0:
+                    loss_arap_rot = compute_rotation_consistency_loss(self.gs_params.quats, self.arap_edges)
+            
+            total_loss = (
+                loss_photo 
+                + loss_mask 
+                + self.cfg.lambda_sv * loss_sv 
+                + loss_mv 
+                + self.cfg.arap_weight * loss_arap 
+                + self.cfg.arap_rot_weight * loss_arap_rot
+            )
             total_loss.backward()
             with self.lock:
                 self.optimizer.step()
@@ -598,9 +746,18 @@ class GSMapping:
             before_count = len(self.gs_params.means)
             with self.lock:
                 self.densify(image_t, depth, mask_t, cam, T_CO_t)
-                self.prune(T_CO_t, cam)
             after_count = len(self.gs_params.means)
-            print(f"Mapping Frame {frame_count}: GS count {before_count} -> {after_count}")
+            print(f"Mapping Frame {frame_count}: Densified {before_count} -> {after_count}")
+        
+        if frame_count > 0 and frame_count % self.cfg.prune_every == 0:
+            before_count = len(self.gs_params.means)
+            with self.lock:
+                self.prune(T_CO_t, cam)
+                self.setup_optimizer()
+                if self.cfg.use_arap:
+                    self._rebuild_arap_graph()
+            after_count = len(self.gs_params.means)
+            print(f"Mapping Frame {frame_count}: Pruned {before_count} -> {after_count}")
 
     def refine_pose(self, image_t, mask_t, cam, T_CO_init, steps=60):
         """Optimizes T_CO and scale to align the GS model with the current image using a pyramid approach."""
@@ -658,9 +815,9 @@ class GSMapping:
                 scaled_means = self.gs_params.means * scale
                 
                 render_image, _, _, _ = render_2dgs(
-                    scaled_means, F.normalize(self.gs_params.quats), 
-                    torch.exp(self.gs_params.scales) * scale, self.gs_params.colors, 
-                    torch.sigmoid(self.gs_params.opacity),
+                    self.gs_params.means * scale, self.gs_params.quats, 
+                    self.gs_params.scales + torch.log(scale), self.gs_params.colors, 
+                    self.gs_params.opacity,
                     viewmat=T_curr, K=curr_K, width=curr_w, height=curr_h
                 )
                 
@@ -682,14 +839,38 @@ class GSMapping:
         self.gs_params.dump(Path(path))
         print(f"GS parameters saved to {path}")
 
-def start_mapping_process(cfg, initial_gs):
-    # Ensure spawn method is used for PyTorch multiprocessing
+def mapping_worker(cfg, gs_params, data_queue, output_queue, stop_event):
+    mapper = GSMapping(cfg, gs_params, output_queue=output_queue)
+    mapper.data_queue = data_queue
+    mapper.stop_event = stop_event
+    mapper.run()
+
+def start_mapping_process(cfg, initial_gs, output_queue: Optional[mp.Queue] = None):
+    # Use the current multiprocessing context to create queues and events
+    ctx = mp.get_context()
     try:
-        mp.set_start_method('spawn', force=True)
+        if mp.get_start_method(allow_none=True) != 'spawn':
+            mp.set_start_method('spawn', force=True)
+            ctx = mp.get_context('spawn')
     except RuntimeError:
-        pass
+        ctx = mp.get_context()
         
-    mapper = GSMapping(cfg, initial_gs)
-    p = mp.Process(target=mapper.run)
+    data_queue = ctx.Queue(maxsize=1)
+    stop_event = ctx.Event()
+    
+    # We pass the components instead of the whole mapper object to avoid pickling issues
+    p = ctx.Process(target=mapping_worker, args=(cfg, initial_gs, data_queue, output_queue, stop_event))
     p.start()
-    return mapper, p
+    
+    # Return a handle that looks like the mapper but is just a proxy for the queues
+    class MapperProxy:
+        def __init__(self, dq, sq):
+            self.data_queue = dq
+            self.stop_event = sq
+        def stop(self):
+            self.stop_event.set()
+        def update(self, data):
+            try: self.data_queue.put_nowait(data)
+            except: pass
+
+    return MapperProxy(data_queue, stop_event), p

@@ -30,6 +30,7 @@ from gs_dyn_obj.utils.init import unproject_depth, d2n_tblr
 from gs_dyn_obj.gs_rendering import render_2dgs
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply, quaternion_to_matrix
 
+from gs_dyn_obj.arap import build_knn_graph, compute_arap_loss, compute_rotation_consistency_loss
 from run_single_view_loss import compute_single_view_loss
 from run_multi_view_loss import compute_multi_view_loss
 
@@ -92,6 +93,13 @@ class MappingConfig:
     align_depth: bool = False
     align_with_bias: bool = True
     seed: Optional[int] = 42
+    
+    # ARAP Rigidity Regularization
+    use_arap: bool = True
+    arap_weight: float = 0.1
+    arap_rot_weight: float = 0.05
+    arap_k: int = 8
+    arap_warmup_steps: int = 30
 
 class MiniCam:
     def __init__(self, K, extrin, width, height, ncc_scale=1.0):
@@ -285,6 +293,24 @@ class GSMapping:
         self.disc_kernel = self.disc_kernel / self.disc_kernel.sum()
         
         self.setup_optimizer()
+
+        # ARAP graph initialization
+        self.arap_edges = None
+        self.arap_ref_dists = None
+        if self.cfg.use_arap:
+            self._rebuild_arap_graph()
+
+    def _rebuild_arap_graph(self):
+        """Build or rebuild k-NN graph and cache reference distances for ARAP loss."""
+        if not self.cfg.use_arap:
+            return
+        with torch.no_grad():
+            curr_means = self.gs_params.means
+            if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                curr_means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
+            self.arap_edges, self.arap_ref_dists = build_knn_graph(
+                curr_means.detach(), k=self.cfg.arap_k
+            )
 
     @property
     def lock(self):
@@ -558,6 +584,8 @@ class GSMapping:
                         self.gs_params.ray_dist = torch.nn.Parameter(torch.cat([self.gs_params.ray_dist.data, new_ray_dist], dim=0))
 
                 self.setup_optimizer()
+                if self.cfg.use_arap:
+                    self._rebuild_arap_graph()
 
     def prune(self, T_CO_t, cam):
         with torch.no_grad():
@@ -704,7 +732,26 @@ class GSMapping:
                                     if d_mask.any():
                                         loss_mv += self.cfg.multi_view_geo_weight * (weights * p_noise)[d_mask].mean() / len(selected_neighbors)
             
-            total_loss = loss_photo + loss_mask + self.cfg.lambda_sv * loss_sv + loss_mv
+            # ARAP Rigidity Regularization
+            loss_arap = torch.tensor(0.0, device=self.device)
+            loss_arap_rot = torch.tensor(0.0, device=self.device)
+            if self.cfg.use_arap and self.arap_edges is not None and step >= self.cfg.arap_warmup_steps:
+                curr_means = self.gs_params.means
+                if self.cfg.use_ray_dist and self.gs_params.ray_dist is not None:
+                    curr_means = self.gs_params.ray_o + self.gs_params.ray_d * self.gs_params.ray_dist
+                
+                loss_arap = compute_arap_loss(curr_means, self.arap_edges, self.arap_ref_dists)
+                if self.cfg.arap_rot_weight > 0:
+                    loss_arap_rot = compute_rotation_consistency_loss(self.gs_params.quats, self.arap_edges)
+            
+            total_loss = (
+                loss_photo 
+                + loss_mask 
+                + self.cfg.lambda_sv * loss_sv 
+                + loss_mv 
+                + self.cfg.arap_weight * loss_arap 
+                + self.cfg.arap_rot_weight * loss_arap_rot
+            )
             if total_loss.requires_grad:
                 total_loss.backward()
                 with self.lock:
@@ -733,6 +780,8 @@ class GSMapping:
             with self.lock:
                 self.prune(T_CO_t, cam)
                 self.setup_optimizer()
+                if self.cfg.use_arap:
+                    self._rebuild_arap_graph()
             after_count = len(self.gs_params.means)
             print(f"Mapping Frame {frame_count}: Pruned {before_count} -> {after_count}")
 

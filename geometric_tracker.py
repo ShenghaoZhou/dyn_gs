@@ -5,6 +5,57 @@ import pyceres
 import pycolmap
 import pycolmap.cost_functions
 from scipy.spatial.transform import Rotation as R
+from dataclasses import dataclass
+from gs_dyn_obj.arap import regularize_lifted_flow_with_arap
+
+@dataclass
+class GeoTrackerConfig:
+    feature_type: str = "orb" # "loftr", "superpoint", "orb", "grid"
+    n_features: int = 2000 # Increased for better robustness
+    min_pnp_inliers: int = 20
+    max_pose_jump: float = 0.1 # meters
+    use_photometric_refinement: bool = True
+    photometric_mode: str = "lm" # "adam" or "lm"
+    n_init_frames: int = 10 # Number of frames for photometric initialization
+    
+    # Grid tracking params
+    grid_spacing: int = 8
+    
+    # PnP params
+    ransac_thresh: float = 1.0
+    
+    # GS Options
+    gs_type: str = "2d" # "2d" or "3d"
+    
+    # Keyframe logic
+    min_kf_interval: int = 3
+    do_refine: bool = True
+    max_keyframes: int = 20
+    min_kf_rot: float = 5.0 # degrees
+    kf_overlap_thresh: float = 0.8
+    
+    # Depth/Geometry
+    near_plane: float = 0.05
+    far_plane: float = 10.0
+    triangulate: bool = True
+    triangulate_thresh: float = 0.05
+    min_depth: float = 0.1
+    max_depth: float = 5.0
+    informed_thresh: float = 10.0
+    align_depth: bool = False
+    align_with_bias: bool = True
+    debug: bool = False
+    use_occlusion_check: bool = False
+    use_informed_filtering: bool = False
+    use_match_projections: bool = False
+    occlusion_margin: float = 0.05
+
+    # ARAP 2D-to-3D Flow Lifting
+    use_arap_flow_lifting: bool = True
+    arap_strain_thresh: float = 0.15
+    arap_k_neighbors: int = 8
+    arap_lambda: float = 5.0
+    arap_opt_steps: int = 25
 
 def interpolate_flow(flow, pts):
     x, y = pts[:, 0], pts[:, 1]
@@ -92,6 +143,9 @@ def apply_anms(kpts, n_to_keep):
 def detect_features_on_mask(image, mask, nfeatures=2000, feature_type="orb"):
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if len(image.shape) == 3 else image
     
+    if mask is not None:
+        mask = mask.astype(np.uint8)
+        
     if feature_type == "orb":
         # Detect significantly more candidates to allow for ANMS
         detector = cv2.ORB_create(nfeatures=nfeatures * 5, fastThreshold=5)
@@ -120,9 +174,10 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
     pose_params = {}
     for idx in frame_indices:
         T = poses[idx]
-        q_xyzw = R.from_matrix(T[:3, :3]).as_quat().astype(np.float64)
+        q = R.from_matrix(T[:3, :3]).as_quat().astype(np.float64)
+        q_wxyz = np.array([q[3], q[0], q[1], q[2]]) # Convert xyzw to wxyz for pycolmap/ceres
         t = T[:3, 3].copy().astype(np.float64)
-        pose_params[idx] = (q_xyzw, t)
+        pose_params[idx] = (q_wxyz, t)
     
     track_params = {}
     relevant_tracks = []
@@ -139,22 +194,24 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
         for f_idx, uv in win_obs.items():
             K = K_dict[f_idx]
             cam_params = np.array([K[0,0], K[1,1], K[0,2], K[1,2]], dtype=np.float64)
-            q_xyzw, t = pose_params[f_idx]
+            q_wxyz, t = pose_params[f_idx]
             cost = pycolmap.cost_functions.ReprojErrorCost('PINHOLE', uv.astype(np.float64))
-            prob.add_residual_block(cost, loss, [q_xyzw, t, pt3d, cam_params])
+            prob.add_residual_block(cost, loss, [q_wxyz, t, pt3d, cam_params])
             prob.set_parameter_block_constant(cam_params)
     
     if fix_first:
         ref_idx = frame_indices[0]
-        prob.set_parameter_block_constant(pose_params[ref_idx][0])
-        prob.set_parameter_block_constant(pose_params[ref_idx][1])
+        if prob.has_parameter_block(pose_params[ref_idx][0]):
+            prob.set_parameter_block_constant(pose_params[ref_idx][0])
+        if prob.has_parameter_block(pose_params[ref_idx][1]):
+            prob.set_parameter_block_constant(pose_params[ref_idx][1])
     
     quat_manifold = pyceres.EigenQuaternionManifold()
     for idx in frame_indices:
-        q_xyzw, t = pose_params[idx]
-        if prob.has_parameter_block(q_xyzw):
-            if not prob.is_parameter_block_constant(q_xyzw):
-                prob.set_manifold(q_xyzw, quat_manifold)
+        q_wxyz, t = pose_params[idx]
+        if prob.has_parameter_block(q_wxyz):
+            if not prob.is_parameter_block_constant(q_wxyz):
+                prob.set_manifold(q_wxyz, quat_manifold)
             
     options = pyceres.SolverOptions()
     options.linear_solver_type = pyceres.LinearSolverType.DENSE_SCHUR
@@ -162,9 +219,9 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
     summary = pyceres.SolverSummary()
     pyceres.solve(options, prob, summary)
     
-    for idx, (q_xyzw, t) in pose_params.items():
+    for idx, (q_wxyz, t) in pose_params.items():
         T = np.eye(4)
-        T[:3, :3] = R.from_quat(q_xyzw).as_matrix()
+        T[:3, :3] = R.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]]).as_matrix()
         T[:3, 3] = t
         poses[idx] = T
     for tid, _ in relevant_tracks:
@@ -193,13 +250,17 @@ def match_projections(frame_idx, image, mask, K, T_CiO, tracks, window=5):
         uv_proj = p_hom[:2] / p_hom[2]
         ix, iy = int(round(uv_proj[0])), int(round(uv_proj[1]))
         
-        if 0 <= ix < w and 0 <= iy < h and mask[iy, ix] > 0:
-            # For now, just trust the projection if it lands on the mask and we have no other track there
-            # In a more advanced version, we would do patch matching around (ix, iy)
-            # Check if any other track is already occupying this pixel
-            # (Simplification: just add it if mask is hit)
-            t['obs'][frame_idx] = uv_proj
-            matched_count += 1
+        found = False
+        for dy in range(-window, window + 1):
+            for dx in range(-window, window + 1):
+                ix_s, iy_s = ix + dx, iy + dy
+                if 0 <= ix_s < w and 0 <= iy_s < h:
+                    if mask[iy_s, ix_s] > 0:
+                        t['obs'][frame_idx] = np.array([uv_proj[0] + dx, uv_proj[1] + dy], dtype=np.float32)
+                        matched_count += 1
+                        found = True
+                        break
+            if found: break
             
     return matched_count
 
@@ -214,14 +275,18 @@ class GeometricTracker:
         self.last_scale = 1.0
         self.triangulated_tids = set()
 
-    def estimate_depth_scale(self, frame_idx, depth, mask, K):
-        if depth is None or len(self.tracks) < 10:
-            return self.last_scale
+    def estimate_depth_alignment(self, frame_idx, depth, mask, K):
+        """
+        Estimate scale (s) and bias (b) such that d_ref = s * d_obs + b.
+        Uses existing 3D tracks as reference.
+        """
+        if len(self.tracks) < 10:
+            return 1.0, 0.0
             
         ref_depths = []
         obs_depths = []
         T_CiO = self.poses.get(frame_idx)
-        if T_CiO is None: return self.last_scale
+        if T_CiO is None: return 1.0, 0.0
 
         for tid, t in self.tracks.items():
             if len(t['obs']) >= 2:
@@ -240,24 +305,56 @@ class GeometricTracker:
                         obs_depths.append(d_new)
         
         if len(ref_depths) > 10:
-            # Use RANSAC for robust scale estimation
-            ref = np.array(ref_depths)
+            # Use Least Squares for robust alignment: ref = s * obs + b
             obs = np.array(obs_depths)
-            scales = ref / obs
+            ref = np.array(ref_depths)
             
-            # Simple RANSAC-like filtering: keep values within 10% of median
+            # Robust filtering to remove outliers before LSTSQ
+            scales = ref / obs
             med = np.median(scales)
-            valid = np.abs(scales - med) < 0.1 * med
-            if np.sum(valid) > 5:
-                self.last_scale = np.mean(scales[valid])
-            else:
-                self.last_scale = med
-        return self.last_scale
+            valid = np.abs(scales - med) < 0.2 * med
+            
+            if np.sum(valid) > 10:
+                if getattr(self.cfg, "align_with_bias", True):
+                    A = np.stack([obs[valid], np.ones_like(obs[valid])], axis=-1)
+                    B = ref[valid]
+                    res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+                    s, b = res[0], res[1]
+                else:
+                    A = obs[valid][:, None]
+                    B = ref[valid]
+                    res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+                    s, b = res[0], 0.0
+                    
+                # Clamp scale to reasonable range to avoid divergence
+                s = np.clip(s, 0.1, 10.0)
+                return float(s), float(b)
+                
+        return 1.0, 0.0
 
-    def add_new_points_from_depth(self, frame_idx, image, mask, depth, K, T_CiO, align=False):
-        if depth is None:
+    def update_object_points(self, new_points):
+        """
+        Update the 3D positions of existing tracks using a new point cloud (e.g. from GS).
+        Uses nearest neighbor search to find corresponding points.
+        """
+        if len(self.tracks) == 0 or len(new_points) == 0:
             return
             
+        from scipy.spatial import KDTree
+        tree = KDTree(new_points)
+        
+        updated_count = 0
+        for tid, t in self.tracks.items():
+            dist, idx = tree.query(t['pt3d'])
+            if dist < 0.05: # Only update if a close point exists (5cm)
+                t['pt3d'] = new_points[idx].copy()
+                updated_count += 1
+        
+        if updated_count > 0:
+            print(f"[GeoTracker] Updated {updated_count} track points from GS model")
+
+
+    def add_new_points_from_depth(self, frame_idx, image, mask, depth, K, T_CiO, align=False, spacing=None):
         mask_work = mask.copy()
         # Avoid adding points where we already have active tracks
         active_uvs = [t['obs'][frame_idx] for t in self.tracks.values() if frame_idx in t['obs']]
@@ -270,23 +367,53 @@ class GeometricTracker:
         if feature_type in ["orb", "gftt"]:
             pts2d = detect_features_on_mask(image, mask_work, nfeatures=n_to_detect, feature_type=feature_type)
         else:
-            pts2d = sample_grid_on_mask(mask_work, self.cfg.grid_spacing)
+            spacing = spacing if spacing is not None else self.cfg.grid_spacing
+            pts2d = sample_grid_on_mask(mask_work, spacing)
             
         best_s, best_b = 1.0, 0.0
-        # ... (rest of depth alignment logic) ...
-        if align:
-            best_s = self.estimate_depth_scale(frame_idx, depth, mask, K)
+        if getattr(self.cfg, "align_depth", False):
+            best_s, best_b = self.estimate_depth_alignment(frame_idx, depth, mask, K)
+            print(f"[GeoTracker] Frame {frame_idx} Depth Alignment: s={best_s:.4f}, b={best_b:.4f}")
         
         depth = best_s * depth + best_b
         
+        # Optional: Compute normals from depth for GS
+        normals_full = None
+        if align:
+            # Simple normal computation from depth
+            dz_dx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
+            dz_dy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
+            # n = [-dz/dx, -dz/dy, 1]
+            fx, fy = K[0, 0], K[1, 1]
+            n_x = -dz_dx * fx
+            n_y = -dz_dy * fy
+            n_z = np.ones_like(depth)
+            mag = np.sqrt(n_x**2 + n_y**2 + n_z**2)
+            normals_full = np.stack([n_x/mag, n_y/mag, n_z/mag], axis=-1)
+
         K_inv = np.linalg.inv(K)
         T_OCi = np.linalg.inv(T_CiO)
         for uv in pts2d:
-            d = depth[int(round(uv[1])), int(round(uv[0]))]
+            ix, iy = int(round(uv[0])), int(round(uv[1]))
+            d = depth[iy, ix]
             if d <= 0.01: continue
             pt_Ci = (K_inv @ np.array([uv[0], uv[1], 1.0])) * d
             pt_O = (T_OCi[:3, :3] @ pt_Ci) + T_OCi[:3, 3]
-            self.tracks[self.next_tid] = {'obs': {frame_idx: uv}, 'pt3d': pt_O}
+            
+            color = image[iy, ix] / 255.0
+            normal_o = None
+            if normals_full is not None:
+                n_c = normals_full[iy, ix]
+                normal_o = T_OCi[:3, :3] @ n_c
+                
+            self.tracks[self.next_tid] = {
+                'obs': {frame_idx: uv}, 
+                'pt3d': pt_O, 
+                'color': color, 
+                'normal': normal_o,
+                'active': True,
+                'frame_idx': frame_idx
+            }
             self.next_tid += 1
 
     def triangulate_tracks(self, frame_idx, thresh):
@@ -348,53 +475,36 @@ class GeometricTracker:
             for i in range(len(tids_pnp)):
                 if inlier_mask[i]:
                     tid = tids_pnp[i]
-                    t = self.tracks[tid]
-                    pts2d.append(t['obs'][frame_idx])
-                    pts3d.append(t['pt3d'])
+                    pts2d.append(self.tracks[tid]['obs'][frame_idx])
+                    pts3d.append(self.tracks[tid]['pt3d'])
         else:
-            # Fallback to all observations (original behavior)
             for tid, t in self.tracks.items():
                 if frame_idx in t['obs']:
                     pts2d.append(t['obs'][frame_idx])
                     pts3d.append(t['pt3d'])
 
-        if len(pts2d) < 10: return
-
-        prob = pyceres.Problem()
-        loss = pyceres.HuberLoss(1.0)
         T = self.poses[frame_idx].copy()
-        q_xyzw = R.from_matrix(T[:3, :3]).as_quat().astype(np.float64)
-        t_vec = T[:3, 3].copy().astype(np.float64)
-        cam_params = np.array([K[0,0], K[1,1], K[0,2], K[1,2]], dtype=np.float64)
+        cam_dict = {"model": "PINHOLE", "width": 1280, "height": 720, "params": [K[0,0], K[1,1], K[0,2], K[1,2]]}
         
-        pts3d_copy = [p.copy().astype(np.float64) for p in pts3d]
+        # Use poselib's built-in refinement
+        pose_in = poselib.CameraPose()
+        q = R.from_matrix(T[:3, :3]).as_quat()
+        pose_in.q = np.array([q[3], q[0], q[1], q[2]]) # wxyz
+        pose_in.t = T[:3, 3]
+        
+        refined_pose, _ = poselib.refine_absolute_pose(np.array(pts2d, dtype=np.float64), np.array(pts3d, dtype=np.float64), pose_in, cam_dict, {"max_iterations": 10})
+        
+        T_refined = np.eye(4)
+        T_refined[:3, :3] = R.from_quat([refined_pose.q[1], refined_pose.q[2], refined_pose.q[3], refined_pose.q[0]]).as_matrix()
+        T_refined[:3, 3] = refined_pose.t
+        self.poses[frame_idx] = T_refined
 
-        for i in range(len(pts2d)):
-            cost = pycolmap.cost_functions.ReprojErrorCost('PINHOLE', pts2d[i].astype(np.float64))
-            prob.add_residual_block(cost, loss, [q_xyzw, t_vec, pts3d_copy[i], cam_params])
-            prob.set_parameter_block_constant(pts3d_copy[i])
-        
-        prob.set_parameter_block_constant(cam_params)
-        prob.set_manifold(q_xyzw, pyceres.EigenQuaternionManifold())
-        
-        options = pyceres.SolverOptions()
-        options.linear_solver_type = pyceres.LinearSolverType.DENSE_QR
-        options.max_num_iterations = 10
-        summary = pyceres.SolverSummary()
-        pyceres.solve(options, prob, summary)
-        
-        if summary.final_cost < summary.initial_cost:
-            T_refined = np.eye(4)
-            T_refined[:3, :3] = R.from_quat(q_xyzw).as_matrix()
-            T_refined[:3, 3] = t_vec
-            self.poses[frame_idx] = T_refined
     def step(self, frame_idx, image, mask, depth, K, flow_prev_curr=None):
         # Default behavior: Constant-velocity motion model guess
         T_prev = self.poses.get(frame_idx-1, np.eye(4))
         T_prev_prev = self.poses.get(frame_idx-2, T_prev)
         T_guess = T_prev @ np.linalg.inv(T_prev_prev) @ T_prev
-        success, n_inliers = self.step_informed(frame_idx, image, mask, depth, K, T_guess, flow_prev_curr=flow_prev_curr)
-        return success, n_inliers
+        return self.step_informed(frame_idx, image, mask, depth, K, T_guess, flow_prev_curr=flow_prev_curr)
 
     def step_informed(self, frame_idx, image, mask, depth, K, T_guess, flow_prev_curr=None, skip_pnp=False):
         self.K_dict[frame_idx] = K
@@ -447,7 +557,10 @@ class GeometricTracker:
             active_at_prev = sum(1 for t in self.tracks.values() if (frame_idx-1) in t['obs'])
             print(f"[GeoTracker] Lost tracking at frame {frame_idx}. Active at prev: {active_at_prev}, survived filtering: {len(pts2d)}")
             self.poses[frame_idx] = self.poses.get(frame_idx-1, np.eye(4)).copy()
-            return False, 0
+            # Try to redetect
+            if mask is not None and depth is not None:
+                self.add_new_points_from_depth(frame_idx, image, mask, depth, K, self.poses[frame_idx])
+            return False
         
         pts2d = np.array(pts2d)
         pts3d = np.array(pts3d)
@@ -486,9 +599,19 @@ class GeometricTracker:
                 T[:3, :3] = R.from_quat([res.pose.q[1], res.pose.q[2], res.pose.q[3], res.pose.q[0]]).as_matrix()
                 T[:3, 3] = res.pose.t
                 
-                # diff_t = np.linalg.norm(T[:3, 3] - T_guess[:3, 3])
-                # diff_R = np.linalg.norm(R.from_matrix(T[:3, :3]).as_rotvec() - R.from_matrix(T_guess[:3, :3]).as_rotvec())
-                # print(f"[GeoTracker] Frame {frame_idx}: PnP moved {diff_t:.4f}m, {np.degrees(diff_R):.2f}deg from guess")
+                # Safety check: if PnP jumps too far from guess, it's likely wrong
+                if T_guess is not None:
+                    diff_t = np.linalg.norm(T[:3, 3] - T_guess[:3, 3])
+                    diff_R = np.rad2deg(np.arccos(np.clip((np.trace(T[:3, :3] @ T_guess[:3, :3].T) - 1) / 2, -1, 1)))
+                    
+                    max_jump_t = getattr(self.cfg, 'max_pose_jump', 0.3)
+                    if diff_t > max_jump_t or diff_R > 15.0: # 15 deg is quite large
+                        print(f"[GeoTracker] Rejecting PnP (jump: {diff_t:.4f}m > {max_jump_t}m or {diff_R:.2f}deg > 15deg)")
+                        T = T_guess.copy()
+                        res = None
+                    else:
+                        if frame_idx % 10 == 0:
+                            print(f"[GeoTracker] Frame {frame_idx}: PnP moved {diff_t:.4f}m, {diff_R:.2f}deg from guess")
             else:
                 T = T_guess.copy()
                 print(f"[GeoTracker] PnP FAILED at frame {frame_idx}, using informed guess.")
@@ -503,9 +626,10 @@ class GeometricTracker:
         
         # Per-frame Motion-only Refinement
         # Note: refine_pose uses self.poses[frame_idx] as initial value.
-        if getattr(self.cfg, "do_refine", True):
-            inliers = info.get('inliers') if info is not None else None
-            self.refine_pose(frame_idx, K, tids_pnp=tids_pnp, inlier_mask=inliers)
+        # if getattr(self.cfg, "do_refine", False): # Changed to False
+        #     inliers = info.get('inliers') if info is not None else None
+        #     self.refine_pose(frame_idx, K, tids_pnp=tids_pnp, inlier_mask=inliers)
+        pass
             
             # diff_t = np.linalg.norm(T_refined[:3, 3] - T[:3, 3])
             # print(f"[GeoTracker] Frame {frame_idx}: Refine moved {diff_t:.4f}m")
@@ -532,10 +656,167 @@ class GeometricTracker:
             for tid in to_remove:
                 if tid in self.tracks: del self.tracks[tid]
             
-            n_inliers = len(info.get('inliers', [])) if info is not None else 0
-            return True, n_inliers
+        # Redetect if track count is low
+        if len(self.tracks) < 20:
+            self.add_new_points_from_depth(frame_idx, image, mask, depth, K, self.poses[frame_idx])
             
-        return True, 0
+        return True
+            
+    def step_informed_with_occlusion(self, frame_idx, image, mask, depth, K, T_guess, flow_prev_curr=None, skip_pnp=False):
+        """
+        Tracking step with explicit depth-based occlusion handling and pose jump protection.
+        """
+        self.K_dict[frame_idx] = K
+        self.poses[frame_idx] = T_guess
+
+        T_arap = None
+        if flow_prev_curr is not None:
+            prev_idx = frame_idx - 1
+            cand_pts2d = []
+            cand_pts3d = []
+            cand_tids = []
+
+            for tid, t in self.tracks.items():
+                if prev_idx in t['obs']:
+                    uv_prev = t['obs'][prev_idx]
+                    delta = interpolate_flow(flow_prev_curr, uv_prev[None])[0]
+                    uv_curr = uv_prev + delta
+                    
+                    ix, iy = int(round(uv_curr[0])), int(round(uv_curr[1]))
+                    # 1. Mask Check
+                    if not (0 <= ix < image.shape[1] and 0 <= iy < image.shape[0] and mask[iy, ix] > 0):
+                        continue
+                        
+                    # 2. Depth Occlusion Check (Crucial for BundleSDF-like behavior)
+                    p_O = t['pt3d']
+                    p_Ci = T_guess[:3, :3] @ p_O + T_guess[:3, 3]
+                    if p_Ci[2] > 0.01:
+                        # Depth Consistency
+                        if depth is not None and getattr(self.cfg, "use_occlusion_check", True):
+                            d_obs = depth[iy, ix]
+                            if d_obs > 0.01 and d_obs < p_Ci[2] - getattr(self.cfg, "occlusion_margin", 0.05):
+                                continue # Occluded by something closer
+                        
+                        # Flow consistency with guess (only if ARAP flow lifting is not active)
+                        if not getattr(self.cfg, "use_arap_flow_lifting", False) and getattr(self.cfg, "use_informed_filtering", True):
+                            uv_proj_hom = K @ p_Ci
+                            uv_proj = uv_proj_hom[:2] / uv_proj_hom[2]
+                            dist = np.linalg.norm(uv_curr - uv_proj)
+                            if dist > getattr(self.cfg, "informed_thresh", 10.0):
+                                continue
+                    
+                    cand_pts2d.append(uv_curr)
+                    cand_pts3d.append(p_O)
+                    cand_tids.append(tid)
+
+            # ARAP Regularization of 2D-to-3D Flow Lifting
+            if getattr(self.cfg, "use_arap_flow_lifting", False) and depth is not None and len(cand_pts2d) >= 15:
+                cand_pts2d_np = np.array(cand_pts2d)
+                cand_pts3d_np = np.array(cand_pts3d)
+                T_arap, inlier_mask, _ = regularize_lifted_flow_with_arap(
+                    cand_pts2d_np, cand_pts3d_np, depth, K,
+                    strain_thresh=getattr(self.cfg, "arap_strain_thresh", 0.15),
+                    k_neighbors=getattr(self.cfg, "arap_k_neighbors", 8),
+                    lambda_arap=getattr(self.cfg, "arap_lambda", 5.0),
+                    num_opt_steps=getattr(self.cfg, "arap_opt_steps", 25)
+                )
+                surviving_idx = np.where(inlier_mask)[0]
+                for s_i in surviving_idx:
+                    tid = cand_tids[s_i]
+                    self.tracks[tid]['obs'][frame_idx] = cand_pts2d_np[s_i]
+            else:
+                for tid, uv in zip(cand_tids, cand_pts2d):
+                    self.tracks[tid]['obs'][frame_idx] = uv
+        
+        # 3. Match Projections (Recover lost tracks)
+        if getattr(self.cfg, "use_match_projections", True):
+            self.match_projections(frame_idx, image, mask, K, T_guess)
+        
+        pts2d, pts3d, tids = [], [], []
+        for tid, t in self.tracks.items():
+            if frame_idx in t['obs']:
+                pts2d.append(t['obs'][frame_idx])
+                pts3d.append(t['pt3d'])
+                tids.append(tid)
+        
+        if len(pts2d) < getattr(self.cfg, "min_pnp_inliers", 15):
+            print(f"[GeoTracker] Insufficient tracks at frame {frame_idx} (found {len(pts2d)})")
+            self.poses[frame_idx] = T_arap if T_arap is not None else T_guess.copy()
+            return False, len(pts2d)
+        
+        pts2d_np = np.array(pts2d)
+        pts3d_np = np.array(pts3d)
+        if frame_idx == 1 and self.cfg.debug:
+            print(f"[DEBUG] Frame 1 PnP: {len(pts2d_np)} points.")
+        cam_dict = {'model': 'PINHOLE', 'width': image.shape[1], 'height': image.shape[0], 'params': [K[0,0], K[1,1], K[0,2], K[1,2]]}
+        
+        prior_pose = T_arap if T_arap is not None else T_guess
+        initial_pose = None
+        if prior_pose is not None:
+            initial_pose = poselib.CameraPose()
+            q = R.from_matrix(prior_pose[:3, :3]).as_quat()
+            initial_pose.q = np.array([q[3], q[0], q[1], q[2]])
+            initial_pose.t = prior_pose[:3, 3]
+
+        n_inliers = 0
+        info = None
+        if not skip_pnp:
+            res, info = poselib.estimate_absolute_pose(
+                pts2d_np.astype(np.float64), pts3d_np, cam_dict, 
+                {'max_reproj_error': self.cfg.ransac_thresh, 'min_iterations': 100, 'max_iterations': 1000}, initial_pose
+            )
+            
+            candidates = []
+            if res is not None:
+                T_pnp = np.eye(4)
+                T_pnp[:3, :3] = R.from_quat([res.pose.q[1], res.pose.q[2], res.pose.q[3], res.pose.q[0]]).as_matrix()
+                T_pnp[:3, 3] = res.pose.t
+                candidates.append(('pnp', T_pnp))
+            if T_arap is not None:
+                candidates.append(('arap', T_arap))
+            candidates.append(('guess', T_guess))
+
+            best_T = candidates[0][1]
+            best_inliers = -1
+            best_name = candidates[0][0]
+
+            pts3d_h = np.concatenate([pts3d_np, np.ones((len(pts3d_np), 1))], axis=1)
+            for name, T_cand in candidates:
+                pts2d_cand_h = (K @ (T_cand[:3] @ pts3d_h.T)).T
+                valid_depth = pts2d_cand_h[:, 2] > 0.01
+                pts2d_cand = pts2d_cand_h[:, :2] / (pts2d_cand_h[:, 2:3] + 1e-8)
+                errs = np.linalg.norm(pts2d_cand - pts2d_np, axis=1)
+                inliers_cand = int(np.sum((errs < self.cfg.ransac_thresh) & valid_depth))
+                if inliers_cand > best_inliers:
+                    best_inliers = inliers_cand
+                    best_T = T_cand
+                    best_name = name
+
+            T = best_T
+            n_inliers = best_inliers
+
+            # Pose Jump Protection
+            diff_t = np.linalg.norm(T[:3, 3] - T_guess[:3, 3])
+            max_jump = getattr(self.cfg, "max_pose_jump", 0.1)
+            if T_arap is not None:
+                diff_arap = np.linalg.norm(T[:3, 3] - T_arap[:3, 3])
+                if diff_arap > 0.08 and diff_t > max_jump and n_inliers < getattr(self.cfg, "min_pnp_inliers", 15):
+                    print(f"[GeoTracker] Rejecting pose (jump: {diff_t:.4f}m, low inliers: {n_inliers})")
+                    T = T_guess.copy()
+            elif diff_t > max_jump:
+                print(f"[GeoTracker] Rejecting pose (jump: {diff_t:.4f}m > {max_jump}m)")
+                T = T_guess.copy()
+        else:
+            T = T_guess.copy()
+            info = None
+            
+        self.poses[frame_idx] = T
+        
+        if getattr(self.cfg, "do_refine", True) and not skip_pnp:
+            inliers = info.get('inliers') if info is not None else None
+            self.refine_pose(frame_idx, K, tids_pnp=tids, inlier_mask=inliers)
+            
+        return True, n_inliers
 
     def run_ba(self):
         if len(self.keyframes) < 2: return

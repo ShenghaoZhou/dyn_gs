@@ -126,6 +126,13 @@ class GlobalConfig:
     seed: int = 42
     show_features: bool = True
     save_rrd: str = ""
+    
+    # ARAP Rigidity
+    use_arap: bool = True
+    arap_weight: float = 0.1
+    arap_rot_weight: float = 0.05
+    arap_k: int = 8
+    arap_warmup_steps: int = 30
 
     # Any4D Multi-view Tracking and Metric Depth
     use_any4d: bool = False
@@ -331,7 +338,12 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         align_depth=cfg.align_depth,
         align_with_bias=cfg.align_with_bias,
         use_pgsr=cfg.use_pgsr,
-        seed=cfg.seed
+        seed=cfg.seed,
+        use_arap=cfg.use_arap,
+        arap_weight=cfg.arap_weight,
+        arap_rot_weight=cfg.arap_rot_weight,
+        arap_k=cfg.arap_k,
+        arap_warmup_steps=cfg.arap_warmup_steps
     )
     
     # Fetch first frame for dense initialization from depth prior

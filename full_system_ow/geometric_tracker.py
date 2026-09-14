@@ -6,6 +6,7 @@ import pycolmap
 import pycolmap.cost_functions
 from scipy.spatial.transform import Rotation as R
 from dataclasses import dataclass
+from gs_dyn_obj.arap import regularize_lifted_flow_with_arap
 
 @dataclass
 class GeoTrackerConfig:
@@ -44,6 +45,17 @@ class GeoTrackerConfig:
     align_depth: bool = False
     align_with_bias: bool = True
     debug: bool = False
+    use_occlusion_check: bool = False
+    use_informed_filtering: bool = False
+    use_match_projections: bool = False
+    occlusion_margin: float = 0.05
+
+    # ARAP 2D-to-3D Flow Lifting
+    use_arap_flow_lifting: bool = True
+    arap_strain_thresh: float = 0.15
+    arap_k_neighbors: int = 8
+    arap_lambda: float = 5.0
+    arap_opt_steps: int = 25
 
 def interpolate_flow(flow, pts):
     x, y = pts[:, 0], pts[:, 1]
@@ -485,7 +497,15 @@ class GeometricTracker:
         T_refined = np.eye(4)
         T_refined[:3, :3] = R.from_quat([refined_pose.q[1], refined_pose.q[2], refined_pose.q[3], refined_pose.q[0]]).as_matrix()
         T_refined[:3, 3] = refined_pose.t
-        self.poses[frame_idx] = T_refined
+        
+        diff_refine_t = np.linalg.norm(T_refined[:3, 3] - T[:3, 3])
+        R_refine_diff = T_refined[:3, :3] @ T[:3, :3].T
+        diff_refine_R = np.rad2deg(np.arccos(np.clip((np.trace(R_refine_diff) - 1) / 2, -1, 1)))
+        if diff_refine_t > 0.15 or diff_refine_R > 10.0:
+            if getattr(self.cfg, "debug", False):
+                print(f"[GeoTracker] Rejecting refinement jump: {diff_refine_t:.4f}m, {diff_refine_R:.2f}deg")
+        else:
+            self.poses[frame_idx] = T_refined
 
     def step(self, frame_idx, image, mask, depth, K, flow_prev_curr=None):
         # Default behavior: Constant-velocity motion model guess
@@ -657,8 +677,13 @@ class GeometricTracker:
         self.K_dict[frame_idx] = K
         self.poses[frame_idx] = T_guess
 
+        T_arap = None
         if flow_prev_curr is not None:
             prev_idx = frame_idx - 1
+            cand_pts2d = []
+            cand_pts3d = []
+            cand_tids = []
+
             for tid, t in self.tracks.items():
                 if prev_idx in t['obs']:
                     uv_prev = t['obs'][prev_idx]
@@ -680,15 +705,36 @@ class GeometricTracker:
                             if d_obs > 0.01 and d_obs < p_Ci[2] - getattr(self.cfg, "occlusion_margin", 0.05):
                                 continue # Occluded by something closer
                         
-                        # Flow consistency with guess
-                        if getattr(self.cfg, "use_informed_filtering", True):
+                        # Flow consistency with guess (only if ARAP flow lifting is not active)
+                        if not getattr(self.cfg, "use_arap_flow_lifting", False) and getattr(self.cfg, "use_informed_filtering", True):
                             uv_proj_hom = K @ p_Ci
                             uv_proj = uv_proj_hom[:2] / uv_proj_hom[2]
                             dist = np.linalg.norm(uv_curr - uv_proj)
                             if dist > getattr(self.cfg, "informed_thresh", 10.0):
                                 continue
                     
-                    t['obs'][frame_idx] = uv_curr
+                    cand_pts2d.append(uv_curr)
+                    cand_pts3d.append(p_O)
+                    cand_tids.append(tid)
+
+            # ARAP Regularization of 2D-to-3D Flow Lifting
+            if getattr(self.cfg, "use_arap_flow_lifting", False) and depth is not None and len(cand_pts2d) >= 15:
+                cand_pts2d_np = np.array(cand_pts2d)
+                cand_pts3d_np = np.array(cand_pts3d)
+                T_arap, inlier_mask, _ = regularize_lifted_flow_with_arap(
+                    cand_pts2d_np, cand_pts3d_np, depth, K,
+                    strain_thresh=getattr(self.cfg, "arap_strain_thresh", 0.15),
+                    k_neighbors=getattr(self.cfg, "arap_k_neighbors", 8),
+                    lambda_arap=getattr(self.cfg, "arap_lambda", 5.0),
+                    num_opt_steps=getattr(self.cfg, "arap_opt_steps", 25)
+                )
+                surviving_idx = np.where(inlier_mask)[0]
+                for s_i in surviving_idx:
+                    tid = cand_tids[s_i]
+                    self.tracks[tid]['obs'][frame_idx] = cand_pts2d_np[s_i]
+            else:
+                for tid, uv in zip(cand_tids, cand_pts2d):
+                    self.tracks[tid]['obs'][frame_idx] = uv
         
         # 3. Match Projections (Recover lost tracks)
         if getattr(self.cfg, "use_match_projections", True):
@@ -703,63 +749,75 @@ class GeometricTracker:
         
         if len(pts2d) < getattr(self.cfg, "min_pnp_inliers", 15):
             print(f"[GeoTracker] Insufficient tracks at frame {frame_idx} (found {len(pts2d)})")
-            self.poses[frame_idx] = T_guess.copy()
-            return False, 0
+            self.poses[frame_idx] = T_arap if T_arap is not None else T_guess.copy()
+            return False, len(pts2d)
         
         pts2d_np = np.array(pts2d)
         pts3d_np = np.array(pts3d)
-        if frame_idx == 1:
+        if frame_idx == 1 and self.cfg.debug:
             print(f"[DEBUG] Frame 1 PnP: {len(pts2d_np)} points.")
-            print(f"[DEBUG] First 5 2D points: {pts2d_np[:5]}")
-            print(f"[DEBUG] First 5 3D points: {pts3d_np[:5]}")
         cam_dict = {'model': 'PINHOLE', 'width': image.shape[1], 'height': image.shape[0], 'params': [K[0,0], K[1,1], K[0,2], K[1,2]]}
         
+        prior_pose = T_arap if T_arap is not None else T_guess
         initial_pose = None
-        if T_guess is not None:
+        if prior_pose is not None:
             initial_pose = poselib.CameraPose()
-            q = R.from_matrix(T_guess[:3, :3]).as_quat()
+            q = R.from_matrix(prior_pose[:3, :3]).as_quat()
             initial_pose.q = np.array([q[3], q[0], q[1], q[2]])
-            initial_pose.t = T_guess[:3, 3]
+            initial_pose.t = prior_pose[:3, 3]
 
         n_inliers = 0
+        info = None
         if not skip_pnp:
             res, info = poselib.estimate_absolute_pose(
                 pts2d_np.astype(np.float64), pts3d_np, cam_dict, 
                 {'max_reproj_error': self.cfg.ransac_thresh, 'min_iterations': 100, 'max_iterations': 1000}, initial_pose
             )
             
+            candidates = []
             if res is not None:
-                n_inliers = len(info.get('inliers', []))
                 T_pnp = np.eye(4)
                 T_pnp[:3, :3] = R.from_quat([res.pose.q[1], res.pose.q[2], res.pose.q[3], res.pose.q[0]]).as_matrix()
                 T_pnp[:3, 3] = res.pose.t
-                
-                # Check inliers of the guess
-                # Project 3D points using guess
-                pts3d_h = np.concatenate([pts3d_np, np.ones((len(pts3d_np), 1))], axis=1)
-                pts2d_guess_h = (K @ (T_guess[:3] @ pts3d_h.T)).T
-                pts2d_guess = pts2d_guess_h[:, :2] / pts2d_guess_h[:, 2:3]
-                errors_guess = np.linalg.norm(pts2d_guess - pts2d_np, axis=1)
-                n_inliers_guess = np.sum(errors_guess < self.cfg.ransac_thresh)
-                
-                if n_inliers_guess > 0.95 * n_inliers:
-                    if self.cfg.debug: print(f"[GeoTracker] Preferring guess (inliers: {n_inliers_guess} vs PnP {n_inliers})")
-                    T = T_guess.copy()
-                    n_inliers = n_inliers_guess
-                else:
-                    T = T_pnp
-                    
-                    # 3. Pose Jump Protection
-                    diff_t = np.linalg.norm(T[:3, 3] - T_guess[:3, 3])
-                    if diff_t > getattr(self.cfg, "max_pose_jump", 0.1):
-                        print(f"[GeoTracker] Rejecting PnP (jump: {diff_t:.4f}m > {getattr(self.cfg, 'max_pose_jump', 0.1)}m)")
-                        T = T_guess.copy()
-                        n_inliers = n_inliers_guess
-                    elif n_inliers < getattr(self.cfg, "min_pnp_inliers", 15):
-                        print(f"[GeoTracker] Rejecting PnP (inliers: {n_inliers} < {getattr(self.cfg, 'min_pnp_inliers', 15)})")
-                        T = T_guess.copy()
-                        n_inliers = n_inliers_guess
-            else:
+                candidates.append(('pnp', T_pnp))
+            if T_arap is not None:
+                candidates.append(('arap', T_arap))
+            candidates.append(('guess', T_guess))
+
+            best_T = candidates[0][1]
+            best_inliers = -1
+            best_name = candidates[0][0]
+
+            pts3d_h = np.concatenate([pts3d_np, np.ones((len(pts3d_np), 1))], axis=1)
+            for name, T_cand in candidates:
+                pts2d_cand_h = (K @ (T_cand[:3] @ pts3d_h.T)).T
+                valid_depth = pts2d_cand_h[:, 2] > 0.01
+                pts2d_cand = pts2d_cand_h[:, :2] / (pts2d_cand_h[:, 2:3] + 1e-8)
+                errs = np.linalg.norm(pts2d_cand - pts2d_np, axis=1)
+                inliers_cand = int(np.sum((errs < self.cfg.ransac_thresh) & valid_depth))
+                if inliers_cand > best_inliers:
+                    best_inliers = inliers_cand
+                    best_T = T_cand
+                    best_name = name
+
+            T = best_T
+            n_inliers = best_inliers
+
+            # Pose Jump Protection (Translation and Rotation)
+            diff_t = np.linalg.norm(T[:3, 3] - T_guess[:3, 3])
+            R_diff = T[:3, :3] @ T_guess[:3, :3].T
+            diff_R = np.rad2deg(np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1)))
+            max_jump = getattr(self.cfg, "max_pose_jump", 0.25)
+            max_rot_jump = getattr(self.cfg, "max_rot_jump", 20.0)
+            
+            is_jump = (diff_t > max_jump) or (diff_R > max_rot_jump)
+            if T_arap is not None:
+                diff_arap = np.linalg.norm(T[:3, 3] - T_arap[:3, 3])
+                if (diff_arap > 0.15 or is_jump) and n_inliers < getattr(self.cfg, "min_pnp_inliers", 15):
+                    print(f"[GeoTracker] Rejecting pose (jump: {diff_t:.4f}m, rot: {diff_R:.2f}deg, low inliers: {n_inliers})")
+                    T = T_arap if diff_arap < diff_t else T_guess.copy()
+            elif is_jump:
+                print(f"[GeoTracker] Rejecting pose (jump: {diff_t:.4f}m > {max_jump}m or rot: {diff_R:.2f}deg > {max_rot_jump}deg)")
                 T = T_guess.copy()
         else:
             T = T_guess.copy()
