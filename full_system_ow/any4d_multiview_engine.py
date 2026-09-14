@@ -459,8 +459,8 @@ class Any4DMultiViewEngine:
         T_WO_ref = window_frames[0].get("T_WO_gt", np.eye(4))
         T_WO_est = T_rel @ T_WO_ref
 
-        # Temporal jump check against last valid estimate (max 35cm per frame)
-        prior_ref = T_WO_prior if T_WO_prior is not None else getattr(self, "last_valid_T_WO", None)
+        # Temporal jump check against last valid Any4D estimate (max 35cm per frame)
+        prior_ref = getattr(self, "last_valid_T_WO", None)
         if prior_ref is not None:
             delta_t = np.linalg.norm(T_WO_est[:3, 3] - prior_ref[:3, 3])
             if delta_t > 0.35:
