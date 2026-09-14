@@ -601,10 +601,10 @@ def main():
     cfg = tyro.cli(GlobalConfig)
     set_seed(cfg.seed)
     
-    # Pre-check for data validity
+    # Pre-check for data validity: only require precomputed model_infer if Any4D is not used
     data_dir = Path(cfg.data_root) / cfg.clip_id
     model_infer_dir = data_dir / "model_infer"
-    if model_infer_dir.exists() and not any(model_infer_dir.iterdir()):
+    if not cfg.use_any4d and model_infer_dir.exists() and not any(model_infer_dir.iterdir()):
         print(f"[Warning] model_infer folder is empty for {cfg.clip_id}. Skipping.")
         return
 

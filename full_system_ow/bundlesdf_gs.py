@@ -505,9 +505,6 @@ class BundleSdfGS:
                     T_rel_a4d = T_CO_a4d @ np.linalg.inv(self.poses[0])
                     self.poses[self.cnt] = T_CO_a4d
                     self.tracker.poses[self.cnt] = T_rel_a4d
-                    n_active_tracks = sum(1 for t in self.tracker.tracks.values() if self.cnt in t['obs'])
-                    if n_active_tracks < 120:
-                        self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, T_rel_a4d, align=False)
                 elif not success:
                     self.tracker.poses[self.cnt] = T_guess
                     self.poses[self.cnt] = T_guess @ self.poses[0]
@@ -515,9 +512,6 @@ class BundleSdfGS:
                     self.poses[self.cnt] = self.tracker.poses[self.cnt] @ self.poses[0]
             else:
                 self.poses[self.cnt] = self.tracker.poses[self.cnt] @ self.poses[0]
-                n_active_tracks = sum(1 for t in self.tracker.tracks.values() if self.cnt in t['obs'])
-                if n_active_tracks < 120:
-                    self.tracker.add_new_points_from_depth(self.cnt, color, mask, depth, K, self.tracker.poses[self.cnt], align=True)
             
             # Sync final pose back to obj_gs for rendering and future frames
             if self.obj_gs is not None:
