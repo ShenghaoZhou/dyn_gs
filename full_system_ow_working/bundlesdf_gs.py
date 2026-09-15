@@ -15,12 +15,14 @@ import queue
 from dataclasses import dataclass, replace
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+from scipy.stats import chi2 as chi2_dist
 from collections import defaultdict
 multiprocessing.set_start_method('spawn', force=True)
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from geometric_tracker import GeometricTracker, run_ba as run_ba_geometric
+from geometric_tracker import GeometricTracker
+import ba as ba_module  # proper bounded-window BA; see ba.py's module docstring
 from gs_dyn_obj.obj_gs import ObjectGS
 from gs_dyn_obj.gs_param import GSParam
 from gs_dyn_obj.gs_rendering import render_2dgs, render_3dgs
@@ -34,6 +36,11 @@ from obj_gs_mapping import GSMapping, MappingConfig, MiniCam, gen_virtul_cam, co
 class GeoTrackerConfig:
     feature_type: str = "orb" # "loftr", "superpoint", "orb", "grid"
     n_features: int = 2000 # Increased for better robustness
+    # Post-PnP ACCEPTANCE floor. `soft_pnp_floor` softens the pre-PnP ATTEMPT
+    # floor (`pnp_attempt_floor`) only, so a 6-candidate solve can run and then
+    # still be vetoed here -- the two dials are independent by design. The
+    # runners used not to declare or forward this at all, so it was pinned at 20
+    # from every entry point; they now pass it through like the chi2 knobs.
     min_pnp_inliers: int = 20
     # Max |pose jump| of PnP vs the predicted guess, in meters.
     # The original value was 10.0 with the comment "Effectively disable rejection
@@ -102,6 +109,65 @@ class GeoTrackerConfig:
     # Snap the geometric tracker's track points onto optimized GS means after each
     # mapping update. Set False to keep the two representations independent.
     update_tracker_points_from_gs: bool = True
+    # Previously read only via getattr(self.cfg, "occlusion_margin", 0.05) in
+    # geometric_tracker, so the 0.05 fallback always won. Declared here with the
+    # same value: behavior-neutral, now actually tunable.
+    occlusion_margin: float = 0.05
+    # Bundle adjustment on keyframe commit (ba.py: bounded window, gauge pin,
+    # acceptance test, shift guard). Default OFF: it changes tracker state, so
+    # the paired A/B baselines (docs/bundlesdf-gate-ab-findings.md) are only
+    # reproducible with this off. When ON, runs after the keyframe decision and
+    # BEFORE T_CiO is composed, so the render, the depth injection and the
+    # mapper enqueue all see the refined pose; a rejected solve writes nothing.
+    # NOTE the scale gauge: reprojection BA cannot observe scale (see ba.py),
+    # so keep an eye on Umeyama s when enabling this for the first time.
+    run_ba_on_keyframe: bool = False
+    ba_max_keyframes: int = 20
+    ba_verbose: bool = True
+    # Phase-0 estimator fixes (geometric_tracker.step_informed_with_occlusion),
+    # all default OFF: they change the live path, so the paired 5-clip A/B
+    # baselines are only reproducible with them off and a matched seed.
+    #
+    # honest_pnp_inliers: n_inliers counts TRUE inliers. poselib's
+    #   info['inliers'] is a python LIST OF bool, one entry per CANDIDATE --
+    #   not a numpy array and not a mask over inliers only (probe-verified in
+    #   test/_probe_poselib_dtype.py: isinstance list, len == 50 == n_candidates,
+    #   int(np.sum(...)) == 41 == num_inliers). So the legacy len() of it is the
+    #   CANDIDATE count, and the 20-inlier gate was measuring how many points PnP
+    #   was asked about rather than how many it actually explained: in that probe
+    #   the gate saw 50 where the truth was 41, and the caller's rejection leg
+    #   inherited the same inflation. num_inliers is the true count. Both the
+    #   legacy len() and the np.sum() read are dtype-agnostic (np.sum coerces the
+    #   list), so the container type is what splits the two paths, not a dtype.
+    #   This flag switches the tracker (and thereby the value the caller sees)
+    #   to num_inliers.
+    # honest_pnp_success: step_informed_with_occlusion returns success=False on
+    #   every path where the PnP result was vetoed or never produced.
+    #   Previously a vetoed frame reported (True, n_inliers_guess), and the
+    #   caller ACCEPTED it -- appending it to accepted_rel and adding points at
+    #   the refined velocity guess -- whenever the guess had >= min_pnp_inliers.
+    # soft_pnp_floor: attempt PnP down to pnp_attempt_floor correspondences
+    #   instead of refusing below min_pnp_inliers (the 20-point cliff: 66/116
+    #   rejections on clip-003318 were never-attempted 19-point frames).
+    #   min_pnp_inliers remains the post-PnP ACCEPTANCE gate.
+    # use_chi2_gate: replace the constant max_pose_jump veto (tracker-internal)
+    #   and the adaptive jump leg of the caller's rejection test with a
+    #   chi-square innovation test (df=6) against a motion covariance built
+    #   from the same accepted-step statistics _jump_limit() already uses.
+    #   Active only after chi2_min_history accepted steps; before that the
+    #   legacy gates run. The photometric-refinement sanity gate keeps its
+    #   adaptive limit -- it guards a different estimator.
+    honest_pnp_inliers: bool = False
+    honest_pnp_success: bool = False
+    soft_pnp_floor: bool = False
+    pnp_attempt_floor: int = 6
+    use_chi2_gate: bool = False
+    chi2_quantile: float = 0.95
+    chi2_min_history: int = 5
+    abs_jump_floor: float = 0.5
+    motion_sigma_floor_t: float = 0.005
+    motion_sigma_floor_r_deg: float = 0.5
+    motion_sigma_scale: float = 3.0
     debug: bool = False
 
 def prepare_gs_optimizer(mapper, cfg, device):
@@ -177,6 +243,13 @@ class BundleSdfGS:
         # False -- see GeoTrackerConfig). Counted for the summary so a drop in
         # keyframe count is not mistaken for the mapper stalling.
         self.kf_skipped_reject = 0
+        # BA accounting (only nonzero when run_ba_on_keyframe is True): how often
+        # the solve ran, how often it was committed vs refused by the acceptance
+        # test / shift guard. A high reject rate is the signal to look at the
+        # triangulation upstream, not to loosen the guards.
+        self.ba_runs = 0
+        self.ba_accepts = 0
+        self.ba_rejects = 0
         
         # Shared state for mapper
         self.kf_queue = multiprocessing.Queue(maxsize=10)
@@ -232,6 +305,94 @@ class BundleSdfGS:
         med_t = float(np.median(st)) if st else 0.01
         med_r = float(np.median(sr)) if sr else 0.5
         return max(floor_t, 8.0 * med_t), max(floor_r, 3.0 * med_r)
+
+    def _motion_covariance(self):
+        """6x6 diagonal innovation covariance for the chi-square gate, built from
+        the same accepted-step statistics _jump_limit() uses: sigma = max(floor,
+        motion_sigma_scale * median) per axis, rotation (rad) first, then
+        translation. Returns None until chi2_min_history accepted steps exist --
+        the gates fall back to the legacy constant/adaptive limits before that.
+        """
+        st = self.accepted_step_t[-50:]
+        sr = self.accepted_step_r[-50:]
+        if len(st) < self.tracker_cfg.chi2_min_history:
+            return None
+        # The statistics above are per ACCEPTED step, not per frame: after a run
+        # of rejected frames accepted_step_t[k] spans several frames, while the
+        # innovation this gate tests is a ONE-frame increment. Normalise by the
+        # gap or a long rejection run inflates sigma with the object's own motion
+        # and the gate turns itself off when it is needed most.
+        gaps = self._accepted_step_gaps(len(st), self.accepted_rel)
+        if gaps is not None:
+            med_t = float(np.median(np.asarray(st, dtype=np.float64) / gaps))
+            med_r = float(np.median(np.asarray(sr, dtype=np.float64) / gaps))
+        else:
+            med_t = float(np.median(st))
+            med_r = float(np.median(sr))
+        s_t = max(self.tracker_cfg.motion_sigma_floor_t,
+                  self.tracker_cfg.motion_sigma_scale * med_t)
+        s_r = np.deg2rad(max(self.tracker_cfg.motion_sigma_floor_r_deg,
+                             self.tracker_cfg.motion_sigma_scale * med_r))
+        return np.diag([s_r ** 2] * 3 + [s_t ** 2] * 3)
+
+    @staticmethod
+    def _accepted_step_gaps(n_steps, rel):
+        """Frame spans for the last ``n_steps`` accepted-step records.
+
+        accepted_step_t[k] is written immediately before accepted_rel.append(cnt),
+        so it is the displacement from rel[k] to rel[k+1] -- aligned by
+        construction. The very first acceptance appends a rel entry but no step
+        record, so len(accepted_step_t) == len(rel) - 1 while the invariant
+        holds; once that breaks the caller falls back to the raw medians.
+        """
+        n_records = len(rel) - 1
+        if n_records < n_steps:
+            return None
+        lo = n_records - n_steps
+        return np.array([int(rel[i + 1]) - int(rel[i]) for i in range(lo, n_records)],
+                        dtype=np.float64).clip(min=1.0)
+
+    @staticmethod
+    def _pnp_gate_carry(tracker):
+        """(vetoed, reason): whether the tracker itself already vetoed this frame.
+
+        The caller's own chi2 tests T_guess -> committed pose. A veto inside
+        step_informed_with_occlusion commits T_guess, so that test scores
+        exactly 0.0 and the caller ACCEPTS the frame: it would then land in
+        accepted_rel and append a near-zero step to the very statistics
+        _motion_covariance is built from, tightening the gate on the strength
+        of a rejected jump.
+
+        The 0.0 only holds when refine is skipped -- i.e. under
+        honest_pnp_success, where refine_allowed is False after a veto. With
+        that flag off the legacy refine overwrites the frozen guess with an
+        unvalidated re-solve, so the caller instead scores a nonzero chi2 on
+        the drift refine introduced (measured: chi2=1.6e3, jump=0.40 m against
+        a 0.5 m floor), which either trips on its own or, if refine drifted
+        less than the floor, is just as blind. Either way the caller is
+        deciding on a quantity the tracker never scored, so return the
+        tracker's own verdict.
+
+        Only the tracker's `last_pnp_gate` is consulted -- not the success
+        flag, which the caller already reads directly.
+
+        Deliberately limited to the chi2 path at the call site: with
+        use_chi2_gate off the tracker vetoes on the constant max_pose_jump
+        threshold only, and carrying that through would change the default-off
+        behaviour the paired A/B baselines are pinned to.
+        """
+        tg = getattr(tracker, "last_pnp_gate", None)
+        if tg is not None and tg.get("vetoed"):
+            return True, (f"tracker chi2={tg['chi2']:.1f} > {tg['limit']:.1f} "
+                          f"(PnP vetoed inside the tracker)")
+        return False, None
+
+    def _innovation_chi2(self, T_a, T_b, motion_cov):
+        """Squared Mahalanobis distance of the 6-dof increment T_a -> T_b under
+        motion_cov (rotvec of R_a^T R_b first, then t_b - t_a)."""
+        dR = R.from_matrix(T_a[:3, :3].T @ T_b[:3, :3]).as_rotvec()
+        d = np.concatenate([dR, T_b[:3, 3] - T_a[:3, 3]])
+        return float(d @ np.linalg.solve(motion_cov, d))
 
     @property
     def mapper_last_finished_frame(self):
@@ -648,16 +809,53 @@ class BundleSdfGS:
 
             # Stage 2: Geometric Tracking
             t0_geo = time.perf_counter()
-            success, n_inliers = self.tracker.step_informed_with_occlusion(self.cnt, color, mask, depth, K, T_guess, flow_prev_curr=flow)
+            motion_cov = self._motion_covariance() if self.tracker_cfg.use_chi2_gate else None
+            success, n_inliers = self.tracker.step_informed_with_occlusion(
+                self.cnt, color, mask, depth, K, T_guess, flow_prev_curr=flow,
+                motion_cov=motion_cov)
             self.timings["Geometric Tracking"].append(time.perf_counter() - t0_geo)
-            
+
             jump = np.linalg.norm(self.tracker.poses[self.cnt][:3, 3] - T_guess[:3, 3])
-            pnp_rejected = (not success) or (n_inliers < self.tracker_cfg.min_pnp_inliers) or (jump > jump_t_lim)
+            gate_reasons = []
+            if motion_cov is not None:
+                # Two gates on the same frame over DIFFERENT pose pairs: the
+                # tracker gated the raw PnP result against T_guess, this one
+                # re-gates the pose that was actually committed (post-refine).
+                # Not redundant -- refine_pose can move the pose a further step
+                # the tracker never scored.
+                chi2 = self._innovation_chi2(T_guess, self.tracker.poses[self.cnt], motion_cov)
+                chi2_lim = float(chi2_dist.ppf(self.tracker_cfg.chi2_quantile, 6))
+                gate_tripped = False
+                if chi2 > chi2_lim:
+                    gate_tripped = True
+                    gate_reasons.append(f"chi2={chi2:.1f} > {chi2_lim:.1f}")
+                if jump > self.tracker_cfg.abs_jump_floor:
+                    gate_tripped = True
+                    gate_reasons.append(f"jump={jump:.4f}m > abs_floor={self.tracker_cfg.abs_jump_floor:.4f}m")
+                carried, carry_reason = self._pnp_gate_carry(self.tracker)
+                if carried:
+                    gate_tripped = True
+                    gate_reasons.append(carry_reason)
+            else:
+                gate_tripped = jump > jump_t_lim
+                if gate_tripped:
+                    gate_reasons.append(f"jump={jump:.4f}m > max_jump={jump_t_lim:.4f}m")
+            pnp_rejected = (not success) or (n_inliers < self.tracker_cfg.min_pnp_inliers) or gate_tripped
             if pnp_rejected:
                 self.pnp_rejections += 1
+                # Only report what actually fired: success/inlier failures and
+                # gate failures are independent conditions, and the gate legs
+                # are independent of each other, so one description does not
+                # cover all of them.
+                reasons = []
+                if not success:
+                    reasons.append("success=False")
+                if n_inliers < self.tracker_cfg.min_pnp_inliers:
+                    reasons.append(f"inliers={n_inliers} < {self.tracker_cfg.min_pnp_inliers}")
+                reasons.extend(gate_reasons)
                 print(
-                    f"[BundleSdfGS] Rejecting PnP (inliers={n_inliers}, jump={jump:.4f}m "
-                    f"> max_jump={jump_t_lim:.4f}m); falling back to velocity guess"
+                    f"[BundleSdfGS] Rejecting PnP ({', '.join(reasons) or 'gate tripped'}); "
+                    f"falling back to velocity guess"
                 )
                 # step_informed_with_occlusion stores the rejected pose in tracker.poses,
                 # so write the guess back explicitly -- reading tracker.poses[cnt] here
@@ -723,6 +921,14 @@ class BundleSdfGS:
             if not is_redundant: is_kf = True
             if self.cnt % 5 == 0: is_kf = True
             if self.cnt < self.tracker_cfg.n_init_frames: is_kf = True
+
+        # Bundle adjustment on keyframe commit (default OFF -- see
+        # GeoTrackerConfig.run_ba_on_keyframe). Placed AFTER the keyframe
+        # decision and BEFORE T_CiO is composed, so the render, the depth
+        # injection and the mapper enqueue below all use the refined pose when
+        # the solve is accepted; a rejected solve leaves everything untouched.
+        if is_kf and self.tracker_cfg.run_ba_on_keyframe:
+            self.run_ba_python()
 
         # Final Pose for this frame: T_CiO
         T_CiO = self.tracker.poses[self.cnt] @ self.poses[0]
@@ -829,15 +1035,53 @@ class BundleSdfGS:
                 self.tracker.update_object_points(self._gs_points_in_tracker_frame())
 
     def run_ba_python(self):
-        if len(self.keyframes) < 2: return
+        """Triangulate, then run bounded-window BA over the committed keyframes.
+
+        The legacy path (geometric_tracker.run_ba) grew the graph with every
+        keyframe, wrote its result back unconditionally, and -- with pycolmap
+        3.13 -- mis-ordered the quaternion block, making it an inert no-op.
+        ba_module.bundle_adjust bounds the window from the front, pins the
+        gauge, and commits only when the solve strictly improves AND no frame
+        moved beyond the shift budget, so a bad triangulation can no longer
+        drag the trajectory. Everything it does is logged via BaResult.
+        """
+        kf_ids = list(self.keyframes)
+        if not kf_ids or kf_ids[-1] != self.cnt:
+            kf_ids.append(self.cnt)  # called before self.cnt is committed
+        if len(kf_ids) < 2:
+            return
         if self.tracker_cfg.triangulate:
-            self.tracker.triangulate_tracks(self.keyframes[-1], self.tracker_cfg.triangulate_thresh)
-        run_ba_geometric(self.keyframes, self.tracker.poses, self.tracker.tracks, self.tracker.K_dict, fix_first=(self.keyframes[0] == 0))
+            self.tracker.triangulate_tracks(kf_ids[-1], self.tracker_cfg.triangulate_thresh)
+        res = ba_module.bundle_adjust(
+            kf_ids, self.tracker.poses, self.tracker.tracks, self.tracker.K_dict,
+            cfg=ba_module.BaConfig(
+                max_keyframes=self.tracker_cfg.ba_max_keyframes,
+                fix_first=(kf_ids[0] == 0),
+                verbose=self.tracker_cfg.ba_verbose,
+            ),
+        )
+        self.ba_runs += 1
+        self.timings["Bundle Adjustment"].append(res.seconds)
+        if res.accepted:
+            self.ba_accepts += 1
+            # Keep the pipeline-facing pose copies consistent with the refined
+            # tracker state (the keyframe-redundancy check reads self.poses for
+            # every past keyframe, every frame). The mapper's already-enqueued
+            # frames keep their pre-BA poses -- that loop closes only on the
+            # next mapping update via update_tracker_points_from_gs.
+            for f in kf_ids:
+                if f in self.tracker.poses and f in self.poses and f != 0:
+                    self.poses[f] = self.tracker.poses[f] @ self.poses[0]
+        elif res.ran:
+            self.ba_rejects += 1
 
     def on_finish(self):
         self.stop_event.set()
         if self.mapping_process:
             self.mapping_process.join()
+        if self.ba_runs:
+            print(f"[BundleSdfGS] BA: {self.ba_runs} runs on keyframe commit, "
+                  f"{self.ba_accepts} accepted, {self.ba_rejects} rejected")
 
 def run_gs_mapping_process(cfg, initial_gs, kf_queue, p_dict, stop_event):
     """Target function for the GS Mapping process."""

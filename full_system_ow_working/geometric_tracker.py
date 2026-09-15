@@ -5,6 +5,7 @@ import pyceres
 import pycolmap
 import pycolmap.cost_functions
 from scipy.spatial.transform import Rotation as R
+from scipy.stats import chi2 as chi2_dist
 from dataclasses import dataclass
 import logging
 
@@ -44,6 +45,22 @@ class GeoTrackerConfig:
     informed_thresh: float = 10.0
     align_depth: bool = False
     align_with_bias: bool = True
+    # Phase-0 estimator fixes, all default OFF (behavior-affecting on the live
+    # path; the paired 5-clip A/B baselines are only reproducible with them off).
+    # honest_pnp_inliers: count TRUE inliers (poselib info['inliers'] is a bool
+    #   mask over all candidates; len() of it is the candidate count).
+    # honest_pnp_success: return success=False on every vetoed/failed PnP path.
+    # soft_pnp_floor: attempt PnP down to pnp_attempt_floor correspondences;
+    #   min_pnp_inliers stays the post-PnP ACCEPTANCE gate (cliff -> slope).
+    # use_chi2_gate: replace the constant max_pose_jump veto with a chi-square
+    #   innovation test against the caller-maintained motion covariance.
+    honest_pnp_inliers: bool = False
+    honest_pnp_success: bool = False
+    soft_pnp_floor: bool = False
+    pnp_attempt_floor: int = 6
+    use_chi2_gate: bool = False
+    chi2_quantile: float = 0.95
+    abs_jump_floor: float = 0.5
     debug: bool = False
 
 def interpolate_flow(flow, pts):
@@ -163,10 +180,14 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
     pose_params = {}
     for idx in frame_indices:
         T = poses[idx]
-        q = R.from_matrix(T[:3, :3]).as_quat().astype(np.float64)
-        q_wxyz = np.array([q[3], q[0], q[1], q[2]]) # Convert xyzw to wxyz for pycolmap/ceres
+        # pycolmap 3.13's ReprojErrorCost reads the q block as xyzw (Eigen memory
+        # layout), exactly scipy's as_quat() order. An earlier version of this
+        # function "converted" to wxyz here and back below; with this pycolmap
+        # that makes the whole solve an inert no-op (initial == final cost, every
+        # block bit-identical). Do not reintroduce any reordering.
+        q_xyzw = R.from_matrix(T[:3, :3]).as_quat().astype(np.float64)
         t = T[:3, 3].copy().astype(np.float64)
-        pose_params[idx] = (q_wxyz, t)
+        pose_params[idx] = (q_xyzw, t)
     
     track_params = {}
     relevant_tracks = []
@@ -183,9 +204,9 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
         for f_idx, uv in win_obs.items():
             K = K_dict[f_idx]
             cam_params = np.array([K[0,0], K[1,1], K[0,2], K[1,2]], dtype=np.float64)
-            q_wxyz, t = pose_params[f_idx]
+            q_xyzw, t = pose_params[f_idx]
             cost = pycolmap.cost_functions.ReprojErrorCost('PINHOLE', uv.astype(np.float64))
-            prob.add_residual_block(cost, loss, [q_wxyz, t, pt3d, cam_params])
+            prob.add_residual_block(cost, loss, [q_xyzw, t, pt3d, cam_params])
             prob.set_parameter_block_constant(cam_params)
     
     if fix_first:
@@ -197,10 +218,10 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
     
     quat_manifold = pyceres.EigenQuaternionManifold()
     for idx in frame_indices:
-        q_wxyz, t = pose_params[idx]
-        if prob.has_parameter_block(q_wxyz):
-            if not prob.is_parameter_block_constant(q_wxyz):
-                prob.set_manifold(q_wxyz, quat_manifold)
+        q_xyzw, t = pose_params[idx]
+        if prob.has_parameter_block(q_xyzw):
+            if not prob.is_parameter_block_constant(q_xyzw):
+                prob.set_manifold(q_xyzw, quat_manifold)
             
     options = pyceres.SolverOptions()
     options.linear_solver_type = pyceres.LinearSolverType.DENSE_SCHUR
@@ -208,9 +229,11 @@ def run_ba(frame_indices, poses, tracks, K_dict, fix_first=True):
     summary = pyceres.SolverSummary()
     pyceres.solve(options, prob, summary)
     
-    for idx, (q_wxyz, t) in pose_params.items():
+    for idx, (q_xyzw, t) in pose_params.items():
         T = np.eye(4)
-        T[:3, :3] = R.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]]).as_matrix()
+        # Block layout is xyzw; scipy reads it natively. Normalize to guard
+        # against drift accumulated by the manifold updates.
+        T[:3, :3] = R.from_quat(q_xyzw / np.linalg.norm(q_xyzw)).as_matrix()
         T[:3, 3] = t
         poses[idx] = T
     for tid, _ in relevant_tracks:
@@ -424,21 +447,27 @@ class GeometricTracker:
         """Perform multi-view triangulation for tracks that have reached the threshold length."""
         for tid, t in self.tracks.items():
             if len(t['obs']) >= thresh and tid not in self.triangulated_tids:
-                self.triangulate_single_track(tid)
-                self.triangulated_tids.add(tid)
+                # Latch ONLY on an actual solve: previously the latch was set even
+                # when triangulate_single_track bailed (too few obs, short
+                # baseline), permanently barring those tracks from ever being
+                # triangulated. Failed tracks now retry with more observations.
+                if self.triangulate_single_track(tid):
+                    self.triangulated_tids.add(tid)
 
     def triangulate_single_track(self, tid):
+        """Refine a track's pt3d by multi-view triangulation. Returns True iff a
+        solve actually ran (regardless of whether its result was accepted)."""
         track = self.tracks[tid]
         obs = track['obs']
-        if len(obs) < 2: return
-        
+        if len(obs) < 2: return False
+
         # Check baseline
         f_indices = sorted(list(obs.keys()))
         t1 = self.poses[f_indices[0]][:3, 3]
         t2 = self.poses[f_indices[-1]][:3, 3]
         baseline = np.linalg.norm(t1 - t2)
         if baseline < 0.005: # 5mm baseline minimum
-            return
+            return False
 
         prob = pyceres.Problem()
         loss = pyceres.HuberLoss(1.0)
@@ -470,10 +499,13 @@ class GeometricTracker:
         summary = pyceres.SolverSummary()
         pyceres.solve(options, prob, summary)
         
-        if summary.final_cost < summary.initial_cost:
+        # IsSolutionUsable rejects converged-to-garbage solves (nan, linear
+        # solver failure) that a bare cost comparison would accept.
+        if summary.IsSolutionUsable() and summary.final_cost < summary.initial_cost:
             track['pt3d'] = pt3d
-    
-    def refine_pose(self, frame_idx, K, tids_pnp=None, inlier_mask=None, W=1280, H=720):
+        return True
+
+    def refine_pose(self, frame_idx, K, tids_pnp=None, inlier_mask=None, *, W, H):
         pts2d, pts3d = [], []
         if tids_pnp is not None and inlier_mask is not None:
             for i in range(len(tids_pnp)):
@@ -486,6 +518,12 @@ class GeometricTracker:
                 if frame_idx in t['obs']:
                     pts2d.append(t['obs'][frame_idx])
                     pts3d.append(t['pt3d'])
+
+        if len(pts2d) < 6:
+            # Keep the pre-refine pose: poselib cannot refine an empty/degenerate
+            # set, and committing its unvalidated output here would silently move
+            # the pose on exactly the frames that are already starved.
+            return
 
         T = self.poses[frame_idx].copy()
         cam_dict = {"model": "PINHOLE", "width": W, "height": H, "params": [K[0,0], K[1,1], K[0,2], K[1,2]]}
@@ -666,12 +704,28 @@ class GeometricTracker:
             
         return True
             
-    def step_informed_with_occlusion(self, frame_idx, image, mask, depth, K, T_guess, flow_prev_curr=None, skip_pnp=False):
+    def step_informed_with_occlusion(self, frame_idx, image, mask, depth, K, T_guess, flow_prev_curr=None, skip_pnp=False, motion_cov=None):
         """
         Tracking step with explicit depth-based occlusion handling and pose jump protection.
+
+        motion_cov: optional 6x6 innovation covariance (diag, rot-first: 3x rad
+        then 3x m) maintained by the caller from accepted-step statistics. Used
+        only when cfg.use_chi2_gate is on, where it replaces the constant
+        max_pose_jump veto with a chi-square innovation test.
         """
         self.K_dict[frame_idx] = K
         self.poses[frame_idx] = T_guess
+
+        # Chi-square gate bookkeeping, carried to the caller. Written
+        # unconditionally (not gated on use_chi2_gate) so the jump_veto branch
+        # below can record into it without an existence check; nothing reads it
+        # unless the caller has use_chi2_gate on, so the default-off path is
+        # unchanged. The caller needs it because it re-gates the pose this
+        # method COMMITS -- already T_guess once the PnP result was vetoed, so
+        # the veto would score exactly 0.0 there and look like an accepted
+        # frame.
+        self.last_pnp_gate = {"vetoed": False, "chi2": 0.0,
+                              "limit": float("inf"), "jump": 0.0}
 
         if flow_prev_curr is not None:
             prev_idx = frame_idx - 1
@@ -717,8 +771,18 @@ class GeometricTracker:
                 pts3d.append(t['pt3d'])
                 tids.append(tid)
         
-        if len(pts2d) < getattr(self.cfg, "min_pnp_inliers", 20):
-            print(f"[GeoTracker] Insufficient tracks at frame {frame_idx} (found {len(pts2d)})")
+        # Pre-PnP attempt floor. Legacy behavior refuses to attempt PnP below
+        # min_pnp_inliers -- a cliff, not a slope: on clip-003318, 66 of 116
+        # rejections were 19-point frames where PnP was never attempted, so the
+        # reported inlier count was a sentinel, not a measurement. With
+        # soft_pnp_floor, PnP is attempted down to pnp_attempt_floor
+        # correspondences and the POST-PnP inlier gate (min_pnp_inliers)
+        # decides acceptance -- the cliff becomes a slope.
+        attempt_floor = (getattr(self.cfg, "pnp_attempt_floor", 6)
+                         if getattr(self.cfg, "soft_pnp_floor", False)
+                         else getattr(self.cfg, "min_pnp_inliers", 20))
+        if len(pts2d) < attempt_floor:
+            print(f"[GeoTracker] Insufficient tracks at frame {frame_idx} (found {len(pts2d)} < {attempt_floor})")
             self.poses[frame_idx] = T_guess.copy()
             return False, 0
         
@@ -738,6 +802,7 @@ class GeometricTracker:
             initial_pose.t = T_guess[:3, 3]
 
         n_inliers = 0
+        pnp_ok = True  # honest-success accounting: cleared by every veto below
         if not skip_pnp:
             res, info = poselib.estimate_absolute_pose(
                 pts2d_np.astype(np.float64), pts3d_np, cam_dict, 
@@ -745,7 +810,21 @@ class GeometricTracker:
             )
             
             if res is not None:
-                n_inliers = len(info.get('inliers', []))
+                # poselib's info['inliers'] is a PYTHON LIST OF bool, one entry per
+                # CANDIDATE -- not a numpy array and not a mask over inliers only
+                # (probe-verified in test/_probe_poselib_dtype.py: isinstance list,
+                # len == 50 == n_candidates, int(np.sum(...)) == 41 == num_inliers).
+                # So len() of it is the CANDIDATE count, not the inlier count: a
+                # 50-candidate solve with 41 true inliers passed a 20-inlier gate on
+                # the strength of 50. num_inliers is the true count. Both reads
+                # below are dtype-agnostic (np.sum() coerces the list; mask[i]
+                # indexes it), so the container type is load-bearing for the
+                # honest/legacy split but not for correctness. Behind a flag: this
+                # changes the live path.
+                if getattr(self.cfg, "honest_pnp_inliers", False):
+                    n_inliers = int(info.get("num_inliers", int(np.sum(info.get("inliers", [])))))
+                else:
+                    n_inliers = len(info.get('inliers', []))
                 T_pnp = np.eye(4)
                 T_pnp[:3, :3] = R.from_quat([res.pose.q[1], res.pose.q[2], res.pose.q[3], res.pose.q[0]]).as_matrix()
                 T_pnp[:3, 3] = res.pose.t
@@ -767,26 +846,73 @@ class GeometricTracker:
                     
                     # 3. Pose Jump Protection
                     diff_t = np.linalg.norm(T[:3, 3] - T_guess[:3, 3])
-                    if diff_t > getattr(self.cfg, "max_pose_jump", 0.1):
+                    jump_veto = False
+                    if motion_cov is not None and getattr(self.cfg, "use_chi2_gate", False):
+                        # Chi-square innovation gate: the 6-dof increment
+                        # (rotvec first, then translation) against the motion
+                        # covariance maintained by the caller from accepted-step
+                        # statistics -- adaptive in all 6 dofs at once, replacing
+                        # the constant max_pose_jump veto. abs_jump_floor is a
+                        # covariance-INDEPENDENT leg of THIS branch only, not a
+                        # global ceiling: the guess-preference branch above keeps T
+                        # at the guess and skips this whole block (no chi2, no
+                        # floor check), and so does motion_cov=None, which falls
+                        # through to the constant max_pose_jump veto below.
+                        dR = R.from_matrix(T_guess[:3, :3].T @ T[:3, :3]).as_rotvec()
+                        d = np.concatenate([dR, T[:3, 3] - T_guess[:3, 3]])
+                        chi2 = float(d @ np.linalg.solve(motion_cov, d))
+                        chi2_lim = float(chi2_dist.ppf(getattr(self.cfg, "chi2_quantile", 0.95), 6))
+                        abs_floor = getattr(self.cfg, "abs_jump_floor", 0.5)
+                        # Recorded for the caller, which cannot see this
+                        # statistic: it only ever observes the committed pose.
+                        self.last_pnp_gate.update(
+                            chi2=chi2, limit=chi2_lim, jump=float(diff_t))
+                        if chi2 > chi2_lim or diff_t > abs_floor:
+                            print(f"[GeoTracker] Rejecting PnP (chi2={chi2:.1f} > {chi2_lim:.1f}, jump {diff_t:.4f}m)")
+                            jump_veto = True
+                    elif diff_t > getattr(self.cfg, "max_pose_jump", 0.1):
                         print(f"[GeoTracker] Rejecting PnP (jump: {diff_t:.4f}m > {getattr(self.cfg, 'max_pose_jump', 0.1)}m)")
+                        jump_veto = True
+
+                    if jump_veto:
                         T = T_guess.copy()
                         n_inliers = n_inliers_guess
+                        pnp_ok = False
+                        self.last_pnp_gate["vetoed"] = True
                     elif n_inliers < getattr(self.cfg, "min_pnp_inliers", 20):
                         print(f"[GeoTracker] Rejecting PnP (inliers: {n_inliers} < {getattr(self.cfg, 'min_pnp_inliers', 20)})")
                         T = T_guess.copy()
                         n_inliers = n_inliers_guess
+                        pnp_ok = False
             else:
                 T = T_guess.copy()
+                pnp_ok = False
         else:
             T = T_guess.copy()
             info = None
             
         self.poses[frame_idx] = T
-        
-        if getattr(self.cfg, "do_refine", True) and not skip_pnp:
+
+        # Refine only a pose the PnP actually produced. Otherwise refine_pose
+        # would re-solve the FROZEN T_guess with the inlier mask of a PnP result
+        # that just failed the inlier or chi-square gate -- and possibly with an
+        # inlier set below min_pnp_inliers -- then overwrite self.poses with that
+        # unvalidated output, so the "frozen guess" was never actually frozen.
+        # Flag-gated: with honest_pnp_success off the legacy behaviour is "refine
+        # whatever got committed", and the paired A/B must stay reproducible.
+        refine_allowed = pnp_ok or not getattr(self.cfg, "honest_pnp_success", False)
+        if getattr(self.cfg, "do_refine", True) and not skip_pnp and refine_allowed:
             inliers = info.get('inliers') if info is not None else None
             self.refine_pose(frame_idx, K, tids_pnp=tids, inlier_mask=inliers, W=image.shape[1], H=image.shape[0])
-            
+
+        # Honest success accounting (flag-gated): a frame whose PnP result was
+        # vetoed -- or never produced -- is not a measurement, even though the
+        # frozen T_guess is committed for pose-dict continuity. Previously every
+        # path except the pre-PnP starvation bail returned True, so the caller
+        # could accept a vetoed frame (and even add points at the refined guess)
+        # whenever the guess happened to have >= min_pnp_inliers inliers.
+        if getattr(self.cfg, "honest_pnp_success", False):
+            return pnp_ok, n_inliers
         return True, n_inliers
 
     def run_ba(self):

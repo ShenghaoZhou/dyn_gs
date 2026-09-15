@@ -148,7 +148,61 @@ class GlobalConfig:
     align_depth_mapper: bool = True
     align_depth_tracker: bool = False
     align_with_bias: bool = True
+    # Replace the mapper's affine (s, b) depth fit + silent np.clip with a
+    # pose-pinned log-scale similarity fit (ba.align_to_object_frame) that
+    # rejects implausible scales instead of clamping them. Default OFF --
+    # needs the paired 5-clip A/B before any default change, same discipline
+    # as gate_kf_commit. See docs/ba-bring-back-findings.md, finding 6.
+    align_depth_sim3_mapper: bool = False
+    # Phase-0 geometric-tracker estimator fixes, each its own default-OFF
+    # switch so a paired 5-clip A/B can isolate one at a time. Full rationale
+    # and the poselib bool-mask finding are in GeoTrackerConfig
+    # (bundlesdf_gs.py) and docs/ba-bring-back-findings.md.
+    honest_pnp_inliers: bool = False
+    honest_pnp_success: bool = False
+    soft_pnp_floor: bool = False
+    # Post-PnP ACCEPTANCE floor. Already on GeoTrackerConfig at 20, but no
+    # runner declared or forwarded it, so there was no dial: with
+    # soft_pnp_floor on, PnP could run on 6 points and every result below 20
+    # inliers was still refused, because soft_pnp_floor only softens the
+    # pre-PnP attempt floor. Default matches GeoTrackerConfig, so nothing
+    # changes until someone sets it.
+    min_pnp_inliers: int = 20
+    use_chi2_gate: bool = False
+    # Numeric knobs for that gate. They used to be unreachable from the runner:
+    # enabling use_chi2_gate turned it on fully hardcoded, so tuning the sigma
+    # floors (docs/ba-bring-back-findings.md, step 4 of the run protocol) meant
+    # editing bundlesdf_gs.py. Every default here matches what GeoTrackerConfig
+    # already ships, so use_chi2_gate=True with none of these touched is
+    # unchanged.
+    pnp_attempt_floor: int = 6
+    chi2_quantile: float = 0.95
+    chi2_min_history: int = 5
+    abs_jump_floor: float = 0.5
+    motion_sigma_floor_t: float = 0.005
+    motion_sigma_floor_r_deg: float = 0.5
+    motion_sigma_scale: float = 3.0
     multiprocess_dyn: bool = False # Default to False as in test_hot3d.py
+    # Coverage-driven keyframe selection in the mapper (keyframe_coverage.py):
+    # decide whether a frame earns a keyframe from its silhouette, instead of on
+    # a fixed kf_every cadence. Default OFF, one flag per paired 5-clip A/B,
+    # same discipline as gate_kf_commit / run_ba_on_keyframe -- enabling it
+    # changes which views enter the mapper's window, so the existing baselines
+    # are only reproducible with it off. Every default below matches
+    # MappingConfig exactly, so use_coverage_kf=False is unchanged.
+    use_coverage_kf: bool = False
+    cov_angle_deg: float = 15.0
+    cov_centroid_shift: float = 0.25
+    cov_shape_ratio: float = 0.5
+    cov_min_interval: int = 3
+    # Neighbour distance bound in view_distance units (orientation/90 + centroid
+    # shift in image widths + shape), not metres: 0.0 means no bound, i.e. always
+    # pick the two most diverse windowed views. Raise if the geo-consistency loss
+    # diverges -- it compares depths, which grow with baseline. Not
+    # multi_view_max_dis, which is a 3-D translation noise and whose default of
+    # 0.1 would exclude every window view.
+    cov_neighbor_max_dis: float = 0.0
+    use_coverage_prune_guard: bool = False
     use_pgsr: bool = False
     # Withhold PnP-rejected frames from the GS keyframe buffer. Default OFF,
     # measured that way: a paired 5-clip A/B (same code, same seed, same clip,
@@ -157,6 +211,27 @@ class GlobalConfig:
     # Kept as a switch so the A/B stays reproducible -- matched seeds are the
     # only way to separate a flag's effect from run-to-run variance here.
     gate_kf_commit: bool = False
+    # Bundle adjustment on keyframe commit (ba.py: bounded window, gauge pin,
+    # acceptance test, shift guard). Default OFF, same discipline as
+    # gate_kf_commit: it changes tracker state, so the paired A/B baselines are
+    # only reproducible with this off and a matched seed. When ON, every solve
+    # logs a one-line BaResult ([BA] accepted/REJECTED ...) and on_finish prints
+    # the accept/reject tally.
+    run_ba_on_keyframe: bool = False
+    # The rest of the BA surface, plus two live reads no runner forwarded.
+    # run_ba_on_keyframe above was wired, but not these: turning BA on left the
+    # window size and the log level pinned at GeoTrackerConfig's 20 / True from
+    # every entry point. triangulate / triangulate_thresh are what run_ba_python
+    # reads for its pre-step; occlusion_margin (P0-5) and
+    # update_tracker_points_from_gs are the other two live reads with no dial.
+    # Every default matches GeoTrackerConfig, so nothing changes until someone
+    # sets one.
+    ba_max_keyframes: int = 20
+    ba_verbose: bool = True
+    triangulate: bool = True
+    triangulate_thresh: float = 0.05
+    occlusion_margin: float = 0.05
+    update_tracker_points_from_gs: bool = True
 
 
 def set_seed(seed: int):
@@ -457,6 +532,26 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         align_depth=cfg.align_depth_tracker,
         align_with_bias=cfg.align_with_bias,
         gate_kf_commit=cfg.gate_kf_commit,
+        run_ba_on_keyframe=cfg.run_ba_on_keyframe,
+        honest_pnp_inliers=cfg.honest_pnp_inliers,
+        honest_pnp_success=cfg.honest_pnp_success,
+        soft_pnp_floor=cfg.soft_pnp_floor,
+        min_pnp_inliers=cfg.min_pnp_inliers,
+        debug=cfg.debug,
+        use_chi2_gate=cfg.use_chi2_gate,
+        pnp_attempt_floor=cfg.pnp_attempt_floor,
+        chi2_quantile=cfg.chi2_quantile,
+        chi2_min_history=cfg.chi2_min_history,
+        abs_jump_floor=cfg.abs_jump_floor,
+        motion_sigma_floor_t=cfg.motion_sigma_floor_t,
+        motion_sigma_floor_r_deg=cfg.motion_sigma_floor_r_deg,
+        motion_sigma_scale=cfg.motion_sigma_scale,
+        ba_max_keyframes=cfg.ba_max_keyframes,
+        ba_verbose=cfg.ba_verbose,
+        triangulate=cfg.triangulate,
+        triangulate_thresh=cfg.triangulate_thresh,
+        occlusion_margin=cfg.occlusion_margin,
+        update_tracker_points_from_gs=cfg.update_tracker_points_from_gs,
     )
     
     map_cfg = MappingConfig(
@@ -473,6 +568,14 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         mask_loss_weight=cfg.mask_loss_weight,
         align_depth=cfg.align_depth_mapper,
         align_with_bias=cfg.align_with_bias,
+        align_depth_sim3=cfg.align_depth_sim3_mapper,
+        use_coverage_kf=cfg.use_coverage_kf,
+        cov_angle_deg=cfg.cov_angle_deg,
+        cov_centroid_shift=cfg.cov_centroid_shift,
+        cov_shape_ratio=cfg.cov_shape_ratio,
+        cov_min_interval=cfg.cov_min_interval,
+        cov_neighbor_max_dis=cfg.cov_neighbor_max_dis,
+        use_coverage_prune_guard=cfg.use_coverage_prune_guard,
         use_pgsr=cfg.use_pgsr
     )
     

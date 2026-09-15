@@ -20,6 +20,7 @@ from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply, quat
 
 from run_single_view_loss import compute_single_view_loss
 from run_multi_view_loss import compute_multi_view_loss
+from keyframe_coverage import KeyframeCoverage, silhouette_descriptor
 
 # Import PGSR-style loss utilities
 import sys
@@ -79,6 +80,43 @@ class MappingConfig:
     use_ray_dist: bool = True
     align_depth: bool = False
     align_with_bias: bool = True
+    # Similarity-mode depth alignment (default OFF; replaces the affine
+    # (s, b) lstsq + np.clip above when align_depth is on). Fits ONLY the
+    # log-scale of a similarity about the camera centre to the unprojected
+    # render/sensor correspondences via ba.align_to_object_frame with the pose
+    # pinned -- a depth buffer can express exactly that one dof; the affine
+    # bias b and the silent clip absorbed arbitrary model/pose error into
+    # geometry. See docs/ba-bring-back-findings.md, finding 6.
+    align_depth_sim3: bool = False
+    align_sim3_max_points: int = 2000
+    align_sim3_huber: float = 0.05
+
+    # Coverage-driven keyframe selection (keyframe_coverage.KeyframeCoverage).
+    # Default OFF: kf_every above is the mapper's actual selection cadence, and
+    # swapping it changes which views enter self.keyframes, so it is a paired
+    # 5-clip A/B behind a switch rather than a change in place. Every numeric
+    # default below reproduces a defensible middle setting; the A/B is meant to
+    # tune cov_angle_deg first, since it is the one knob that decides how far
+    # apart in object rotation two keyframes must be. See the keyframe_coverage
+    # module docstring for the 2D flip limit and why 3D coverage is deferred.
+    use_coverage_kf: bool = False
+    cov_angle_deg: float = 15.0
+    cov_centroid_shift: float = 0.25
+    cov_shape_ratio: float = 0.5
+    cov_min_interval: int = 3
+    # Upper bound on how far a picked neighbour may be, in view_distance units
+    # (orientation/90 + centroid shift in image widths + shape), NOT metres.
+    # 0.0 means no bound, which is the default: pick the two most diverse
+    # views. It cannot reuse multi_view_max_dis above -- that is a 3-D
+    # translation noise in metres, and its default of 0.1 would exclude every
+    # window view at once and reduce the feature to the virtual-camera
+    # fallback. Raise it if the geo-consistency loss starts diverging, since
+    # it compares depths and those grow with baseline.
+    cov_neighbor_max_dis: float = 0.0
+    # prune() currently keeps geometry only for the single view it is called
+    # from, so a view that shows the object large can erase geometry the window
+    # still needs. Default OFF for the same reason as use_coverage_kf.
+    use_coverage_prune_guard: bool = False
 
 class MiniCam:
     def __init__(self, K, extrin, width, height, ncc_scale=1.0):
@@ -262,6 +300,14 @@ class GSMapping:
         self.stop_event = mp.Event()
         self._lock = None
         self.keyframes = []
+        # Always constructed so the use sites only need to test the flag; it is
+        # ~free (a list and an int) and unused when use_coverage_kf is off.
+        self.coverage = KeyframeCoverage(
+            max_window=cfg.window_size,
+            min_interval=cfg.cov_min_interval,
+            angle_deg=cfg.cov_angle_deg,
+            centroid_shift=cfg.cov_centroid_shift,
+            shape_ratio=cfg.cov_shape_ratio)
         self.device = torch.device(cfg.device)
         self.gs_params.to(self.device)
         
@@ -348,6 +394,7 @@ class GSMapping:
             
             self.setup_optimizer()
             self.keyframes = []
+            self.coverage.reset()
             
             radius = 3
             self.disc_kernel = torch.zeros(1, 1, 2 * radius + 1, 2 * radius + 1, device=self.device)
@@ -434,21 +481,56 @@ class GSMapping:
                     valid = np.abs(scales - med) < 0.2 * med
                     
                     if np.sum(valid) > 50:
-                        if getattr(self.cfg, "align_with_bias", True):
-                            A = np.stack([obs[valid], np.ones_like(obs[valid])], axis=-1)
-                            B = ref[valid]
-                            res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
-                            s, b = res[0], res[1]
+                        if getattr(self.cfg, "align_depth_sim3", False):
+                            # Fit the log-scale of a similarity about the camera
+                            # centre to the unprojected correspondences, with the
+                            # pose pinned at the identity: both depth maps live in
+                            # this camera frame, so a nonzero R/t would be pose
+                            # error leaking into the depth buffer, and freeing it
+                            # would trade translation against scale on near-planar
+                            # geometry. Rejects (loudly) instead of np.clip-ing.
+                            import ba as ba_module
+                            ys, xs = torch.where(overlap_mask)
+                            ys = ys.cpu().numpy()[valid]
+                            xs = xs.cpu().numpy()[valid]
+                            zo, zr = obs[valid], ref[valid]
+                            max_pts = int(getattr(self.cfg, "align_sim3_max_points", 2000))
+                            if len(zo) > max_pts:
+                                idx = np.linspace(0, len(zo) - 1, max_pts).astype(np.int64)
+                                ys, xs, zo, zr = ys[idx], xs[idx], zo[idx], zr[idx]
+                            fx, fy = float(cam.K[0, 0]), float(cam.K[1, 1])
+                            cx, cy = float(cam.K[0, 2]), float(cam.K[1, 2])
+                            pts_obs = np.stack([(xs - cx) * zo / fx,
+                                                (ys - cy) * zo / fy, zo], axis=-1)
+                            pts_ref = np.stack([(xs - cx) * zr / fx,
+                                                (ys - cy) * zr / fy, zr], axis=-1)
+                            res = ba_module.align_to_object_frame(
+                                pts_tracker=pts_obs, pts_object=pts_ref,
+                                pin_pose=True,
+                                huber_delta=float(getattr(self.cfg, "align_sim3_huber", 0.05)),
+                            )
+                            s = res["s"]
+                            if res["accepted"] and 0.1 <= s <= 10.0:
+                                depth_curr_t = s * depth_curr_t
+                            else:
+                                print(f"[Mapper] Sim3 depth alignment rejected: s={s:.4f}, "
+                                      f"cost {res['initial_cost']:.4g} -> {res['final_cost']:.4g}")
                         else:
-                            A = obs[valid][:, None]
-                            B = ref[valid]
-                            res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
-                            s, b = res[0], 0.0
-                            
-                        # Clamp scale to reasonable range
-                        s = np.clip(s, 0.1, 10.0)
-                        depth_curr_t = s * depth_curr_t + b
-                        # print(f"[Mapper] Depth Alignment: s={s:.4f}, b={b:.4f}")
+                            if getattr(self.cfg, "align_with_bias", True):
+                                A = np.stack([obs[valid], np.ones_like(obs[valid])], axis=-1)
+                                B = ref[valid]
+                                res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+                                s, b = res[0], res[1]
+                            else:
+                                A = obs[valid][:, None]
+                                B = ref[valid]
+                                res, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+                                s, b = res[0], 0.0
+
+                            # Clamp scale to reasonable range
+                            s = np.clip(s, 0.1, 10.0)
+                            depth_curr_t = s * depth_curr_t + b
+                            # print(f"[Mapper] Depth Alignment: s={s:.4f}, b={b:.4f}")
             # 1. Laplacian-based sampling (High frequency details)
             init_proba, penalty = get_lapla_norm(image_t, self.disc_kernel), get_lapla_norm(render_image, self.disc_kernel)
             sample_mask = (torch.rand_like(init_proba) < (init_proba - penalty) * 15.0) & mask_t & (depth_curr_t > 0)
@@ -554,6 +636,18 @@ class GSMapping:
             opacity = torch.sigmoid(self.gs_params.opacity.squeeze(-1))
             valid_mask = (opacity > self.cfg.prune_opacity_th)
             valid_mask &= (screen_size < self.cfg.prune_screen_size_th)
+            if self.cfg.use_coverage_prune_guard:
+                # screen_size is measured for one view only, so a frame that sees
+                # the object large would prune geometry the windowed keyframes
+                # still need -- and those keyframes are exactly the views the
+                # multi-view loss is being fitted against. Keep any point that is
+                # large on screen from at least one windowed keyframe.
+                for kf in self.keyframes:
+                    T_OC = kf[0].world_view_transform.t()
+                    means_k = torch.einsum('ij,nj->ni', T_OC[:3, :3], self.gs_params.means) + T_OC[:3, 3]
+                    dist_k = means_k[:, 2].clamp_min(0.01)
+                    screen_size_k = kf[0].K[0, 0] * torch.exp(self.gs_params.scales).max(dim=-1)[0] / dist_k
+                    valid_mask |= (screen_size_k >= self.cfg.prune_screen_size_th)
             valid_mask &= (dist > self.cfg.near_plane) & (dist < self.cfg.far_plane)
 
             if valid_mask.sum() == 0: valid_mask = torch.ones_like(valid_mask)
@@ -579,6 +673,10 @@ class GSMapping:
             T_CO = frame_data["T_CiO"]
         
         H, W = image.shape[:2]
+        # This frame's view descriptor, computed once before the step loop so
+        # all 300 steps below read the same value. Drives both the keyframe
+        # decision (end of the frame) and the neighbour distance (in the loop).
+        self._coverage_desc = silhouette_descriptor(mask, W, H) if self.cfg.use_coverage_kf else None
         image_t = torch.from_numpy(image).float().to(self.device).permute(2, 0, 1) / 255.0
         mask_t = torch.from_numpy(mask > 0).bool().to(self.device)
         T_CO_t = torch.from_numpy(T_CO).float().to(self.device)
@@ -646,12 +744,29 @@ class GSMapping:
                 
                 if step >= 30:
                     # Select keyframes or use virtual camera
-                    potential_neighbors = [kf for kf in self.keyframes if np.linalg.norm(kf[0].world_view_transform[3, :3].cpu().numpy() - cam.world_view_transform[3, :3].cpu().numpy()) > self.cfg.multi_view_min_dis]
-                    
-                    selected_neighbors = []
-                    if potential_neighbors:
-                        selected_neighbors = random.sample(potential_neighbors, min(2, len(potential_neighbors)))
-                    
+                    if self.cfg.use_coverage_kf:
+                        # Pick the windowed views furthest from this one, so the
+                        # multi-view loss is a spread over the object rather than
+                        # a cluster around the current view. The current frame is
+                        # never its own neighbour: keyframes are appended at the
+                        # end of optimize_frame, so the window holds prior frames
+                        # only.
+                        selected_neighbors = []
+                        if self._coverage_desc is not None:
+                            picked = self.coverage.most_diverse_indices(
+                                self._coverage_desc, limit=2,
+                                max_dis=self.cfg.cov_neighbor_max_dis
+                                if self.cfg.cov_neighbor_max_dis > 0 else None)
+                            for i, _dis in picked:
+                                if 0 <= i < len(self.keyframes):
+                                    selected_neighbors.append(self.keyframes[i])
+                    else:
+                        potential_neighbors = [kf for kf in self.keyframes if np.linalg.norm(kf[0].world_view_transform[3, :3].cpu().numpy() - cam.world_view_transform[3, :3].cpu().numpy()) > self.cfg.multi_view_min_dis]
+
+                        selected_neighbors = []
+                        if potential_neighbors:
+                            selected_neighbors = random.sample(potential_neighbors, min(2, len(potential_neighbors)))
+
                     # Virtual camera logic
                     if (self.cfg.use_virtul_cam and random.random() < self.cfg.virtul_cam_prob) or not selected_neighbors:
                         v_cam = gen_virtul_cam(cam, trans_noise=self.cfg.multi_view_max_dis)
@@ -694,7 +809,15 @@ class GSMapping:
                 self.optimizer.step()
         
         # Maintenance
-        if frame_count % self.cfg.kf_every == 0:
+        if self.cfg.use_coverage_kf:
+            # Coverage replaces the fixed kf_every cadence: the question is
+            # whether the window already covers this view, not whether we hit a
+            # multiple of kf_every. kf_every is left untouched, so the flag off
+            # path is byte-identical to the previous mapper.
+            add_kf = self._coverage_desc is not None and self.coverage.update(mask, W, H, frame_count)
+        else:
+            add_kf = frame_count % self.cfg.kf_every == 0
+        if add_kf:
             with torch.no_grad():
                 render_mode = "3dgs" if self.cfg.gs_type == "3d" else "normal"
                 _, r_depth, _, _ = self.gs_params.render(T_CO_t, K_t, W, H, mode=render_mode)

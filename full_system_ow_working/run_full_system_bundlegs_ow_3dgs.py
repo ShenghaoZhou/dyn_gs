@@ -109,9 +109,62 @@ class GlobalConfig:
     # Tracker specific
     use_informed_filtering: bool = True
     use_occlusion_check: bool = True
+    # Phase-0 tracker / BA switches, mirroring run_full_system_bundlegs_ow.py so
+    # this variant can run the same paired A/B. Each is its own default-OFF knob
+    # for one flag at a time -- see docs/ba-bring-back-findings.md.
+    gate_kf_commit: bool = False
+    run_ba_on_keyframe: bool = False
+    honest_pnp_inliers: bool = False
+    honest_pnp_success: bool = False
+    soft_pnp_floor: bool = False
+    # Post-PnP ACCEPTANCE floor. Already on GeoTrackerConfig at 20, but no
+    # runner declared or forwarded it, so there was no dial: soft_pnp_floor
+    # only softens the pre-PnP attempt floor, so every result below 20 inliers
+    # was still refused. Mirrors run_full_system_bundlegs_ow.py; default
+    # matches GeoTrackerConfig, so nothing changes until someone sets it.
+    min_pnp_inliers: int = 20
+    use_chi2_gate: bool = False
+    # Numeric knobs for the chi2 gate, mirroring run_full_system_bundlegs_ow.py.
+    # Defaults match GeoTrackerConfig's own, so use_chi2_gate=True with these
+    # untouched is unchanged; before this they were only reachable by editing
+    # bundlesdf_gs.py.
+    pnp_attempt_floor: int = 6
+    chi2_quantile: float = 0.95
+    chi2_min_history: int = 5
+    abs_jump_floor: float = 0.5
+    motion_sigma_floor_t: float = 0.005
+    motion_sigma_floor_r_deg: float = 0.5
+    motion_sigma_scale: float = 3.0
+    # The rest of the BA surface, mirroring run_full_system_bundlegs_ow.py.
+    # run_ba_on_keyframe above was wired, but not these: turning BA on left the
+    # window size and log level pinned at GeoTrackerConfig's 20 / True, and
+    # run_ba_python's triangulate pre-step had no dial either. Same for
+    # occlusion_margin (P0-5) and update_tracker_points_from_gs. Defaults match
+    # GeoTrackerConfig, so nothing changes until someone sets one.
+    ba_max_keyframes: int = 20
+    ba_verbose: bool = True
+    triangulate: bool = True
+    triangulate_thresh: float = 0.05
+    occlusion_margin: float = 0.05
+    update_tracker_points_from_gs: bool = True
+    # Mapper depth alignment via a pose-pinned log-scale fit (default OFF).
+    align_depth_sim3_mapper: bool = False
     align_depth: bool = True
     align_with_bias: bool = True
     multiprocess_dyn: bool = False # Default to False as in test_hot3d.py
+    # Coverage-driven keyframe selection in the mapper (keyframe_coverage.py).
+    # Default OFF, one flag per paired 5-clip A/B; every default below matches
+    # MappingConfig, so use_coverage_kf=False is unchanged. Mirrors
+    # run_full_system_bundlegs_ow.py so the paired A/B is the same across variants.
+    use_coverage_kf: bool = False
+    cov_angle_deg: float = 15.0
+    cov_centroid_shift: float = 0.25
+    cov_shape_ratio: float = 0.5
+    cov_min_interval: int = 3
+    # view_distance units, not metres; 0.0 means no bound. See
+    # run_full_system_bundlegs_ow.py for the rationale.
+    cov_neighbor_max_dis: float = 0.0
+    use_coverage_prune_guard: bool = False
     use_pgsr: bool = False
 
 def load_frame_data_v2(data_dir, frame_idx):
@@ -268,7 +321,29 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         use_occlusion_check=cfg.use_occlusion_check,
         min_kf_rot=cfg.min_kf_rot,
         kf_overlap_thresh=cfg.kf_overlap_thresh,
-        min_kf_interval=cfg.min_kf_interval
+        min_kf_interval=cfg.min_kf_interval,
+        align_with_bias=cfg.align_with_bias,
+        gate_kf_commit=cfg.gate_kf_commit,
+        run_ba_on_keyframe=cfg.run_ba_on_keyframe,
+        honest_pnp_inliers=cfg.honest_pnp_inliers,
+        honest_pnp_success=cfg.honest_pnp_success,
+        soft_pnp_floor=cfg.soft_pnp_floor,
+        min_pnp_inliers=cfg.min_pnp_inliers,
+        debug=cfg.debug,
+        use_chi2_gate=cfg.use_chi2_gate,
+        pnp_attempt_floor=cfg.pnp_attempt_floor,
+        chi2_quantile=cfg.chi2_quantile,
+        chi2_min_history=cfg.chi2_min_history,
+        abs_jump_floor=cfg.abs_jump_floor,
+        motion_sigma_floor_t=cfg.motion_sigma_floor_t,
+        motion_sigma_floor_r_deg=cfg.motion_sigma_floor_r_deg,
+        motion_sigma_scale=cfg.motion_sigma_scale,
+        ba_max_keyframes=cfg.ba_max_keyframes,
+        ba_verbose=cfg.ba_verbose,
+        triangulate=cfg.triangulate,
+        triangulate_thresh=cfg.triangulate_thresh,
+        occlusion_margin=cfg.occlusion_margin,
+        update_tracker_points_from_gs=cfg.update_tracker_points_from_gs,
     )
     
     map_cfg = MappingConfig(
@@ -285,6 +360,14 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         mask_loss_weight=cfg.mask_loss_weight,
         align_depth=cfg.align_depth,
         align_with_bias=cfg.align_with_bias,
+        align_depth_sim3=cfg.align_depth_sim3_mapper,
+        use_coverage_kf=cfg.use_coverage_kf,
+        cov_angle_deg=cfg.cov_angle_deg,
+        cov_centroid_shift=cfg.cov_centroid_shift,
+        cov_shape_ratio=cfg.cov_shape_ratio,
+        cov_min_interval=cfg.cov_min_interval,
+        cov_neighbor_max_dis=cfg.cov_neighbor_max_dis,
+        use_coverage_prune_guard=cfg.use_coverage_prune_guard,
         use_pgsr=cfg.use_pgsr
     )
     
