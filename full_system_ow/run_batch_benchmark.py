@@ -16,12 +16,12 @@ CLIPS_DEFAULT = [
 ]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch benchmark runner for full_system_ow with Any4D")
+    parser = argparse.ArgumentParser(description="Batch benchmark runner for full_system_ow")
     parser.add_argument("--data-root", type=str, default="data/hot3d_clips_processed_more")
     parser.add_argument("--clips", nargs="+", default=CLIPS_DEFAULT)
     parser.add_argument("--num-frames", type=int, default=150)
     parser.add_argument("--use-any4d", action="store_true", default=False)
-    parser.add_argument("--output-csv", type=str, default="benchmark_any4d_results.csv")
+    parser.add_argument("--output-csv", type=str, default="benchmark_full_system_results.csv")
     return parser.parse_args()
 
 def run_clip(clip_id, args):
