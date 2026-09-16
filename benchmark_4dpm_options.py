@@ -87,6 +87,7 @@ def main():
         ("Baseline", []),
         ("Option A (4D_PM Prior)", ["--use-4dpm-prior"]),
         ("Option B (4D_PM GN BA)", ["--use-4dpm-gn"]),
+        ("Option A + B (Prior + GN)", ["--use-4dpm-prior", "--use-4dpm-gn"]),
     ]
 
     results = []
