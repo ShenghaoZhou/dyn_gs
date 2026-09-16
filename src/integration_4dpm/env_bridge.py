@@ -13,9 +13,17 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Standard path to 4D_PM repository and python binary
-PM_ROOT = Path("/home/shzhou/project/super_primitive/4D_PM").resolve()
+# Standard path to 4D_PM repository and python binary (configurable via FOUR_DPM_PATH env var)
+PM_ROOT_PATH = os.environ.get("FOUR_DPM_PATH", "/home/shzhou/project/super_primitive/4D_PM")
+PM_ROOT = Path(PM_ROOT_PATH).resolve()
+
+# Support pixi, conda, or direct virtualenv layout
 PM_PYTHON = PM_ROOT / ".pixi" / "envs" / "default" / "bin" / "python"
+if not PM_PYTHON.exists():
+    candidate_python = PM_ROOT / "envs" / "4DPM" / "bin" / "python"
+    if candidate_python.exists():
+        PM_PYTHON = candidate_python
+
 PI3_DEFAULT_PATH = PM_ROOT / "third_party" / "Pi3"
 
 
