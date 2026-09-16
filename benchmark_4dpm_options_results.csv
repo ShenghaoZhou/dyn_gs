@@ -1,0 +1,7 @@
+clip_id,variant,num_frames,ate_m,ate_cm,psnr_db,runtime_s,fps,success
+clip-001851,Baseline,30,0.0364,3.64,21.2,13.02,2.3,True
+clip-001851,Option A (4D_PM Prior),30,0.014,1.4000000000000001,21.16,13.07,2.3,True
+clip-001851,Option B (4D_PM GN BA),30,0.0126,1.26,21.1,12.96,2.32,True
+clip-001853,Baseline,30,0.0166,1.66,21.06,10.62,2.83,True
+clip-001853,Option A (4D_PM Prior),30,0.0101,1.01,21.03,16.89,1.78,True
+clip-001853,Option B (4D_PM GN BA),30,0.0245,2.45,21.05,10.5,2.86,True

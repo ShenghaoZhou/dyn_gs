@@ -3,10 +3,13 @@ import os
 from pathlib import Path
 from typing import Literal
 
-# Add current folder to sys.path for self-contained imports
+# Add current folder and workspace root to sys.path
 project_root = Path(__file__).parent.absolute()
+workspace_root = project_root.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+if str(workspace_root) not in sys.path:
+    sys.path.insert(0, str(workspace_root))
 
 # Imports from project
 from dataclasses import dataclass
@@ -140,6 +143,11 @@ class GlobalConfig:
     any4d_window_size: int = 4
     any4d_use_known_poses: bool = True
     any4d_replace_depth: bool = True
+
+    # 4D_PM Integration Options
+    use_4dpm_prior: bool = False  # Option A: Multi-view Pi3 + SAM2 Prior
+    use_4dpm_gn: bool = False     # Option B: Analytical Gauss-Newton BA
+    mode: Literal["online", "two_pass"] = "online" # Option C: Two-pass 4D_PM + Dynamic GS
 
 def draw_tracks(image, tracks, frame_idx, tail_length=5):
     """Draws feature tracks on the image."""
@@ -320,7 +328,8 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
         use_occlusion_check=cfg.use_occlusion_check,
         min_kf_rot=cfg.min_kf_rot,
         kf_overlap_thresh=cfg.kf_overlap_thresh,
-        min_kf_interval=cfg.min_kf_interval
+        min_kf_interval=cfg.min_kf_interval,
+        use_4dpm_gn=cfg.use_4dpm_gn
     )
     
     map_cfg = MappingConfig(
@@ -377,6 +386,17 @@ def dynamic_worker(cfg: GlobalConfig, bg_queue, data_q):
             print("[Dynamic Worker] Using Any4D metric depth for initial frame.")
             depth_f0 = depth_a4d_0
             f0["depth"] = depth_a4d_0
+
+    if cfg.use_4dpm_prior:
+        try:
+            from src.integration_4dpm.frontend_prior import compute_or_load_4dpm_prior
+            clip_dir = str(Path(cfg.data_root) / cfg.clip_id)
+            pm_prior = compute_or_load_4dpm_prior(clip_dir, cfg.clip_id, num_init_kfs=5, kf_interval=2)
+            print("[Dynamic Worker] Using 4D_PM Pi3 Multi-View Depth & Geometry Prior for Frame 0.")
+            depth_f0 = pm_prior["depth"]
+            f0["depth"] = pm_prior["depth"]
+        except Exception as e:
+            print(f"[Dynamic Worker] Warning: Failed to load 4D_PM prior: {e}")
 
     if depth_f0 is None:
         print(f"[Dynamic Worker] Error: No depth found for frame {f0['frame_idx']}, cannot initialize GS.")

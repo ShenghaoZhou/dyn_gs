@@ -65,10 +65,13 @@ class GeoTrackerConfig:
     use_match_projections: bool = False
     debug: bool = False
 
-    # ARAP 2D-to-3D Flow Lifting
-    use_arap_flow_lifting: bool = True
-    arap_strain_thresh: float = 0.15
-    arap_k_neighbors: int = 8
+    # Any4D Divergence Guard
+    any4d_adaptive_divergence: bool = True
+    any4d_base_thresh: float = 0.04
+    any4d_max_thresh: float = 0.12
+
+    # 4D_PM Options
+    use_4dpm_gn: bool = False
     arap_lambda: float = 5.0
     arap_opt_steps: int = 25
 
@@ -706,6 +709,20 @@ class BundleSdfGS:
 
     def run_ba_python(self):
         if len(self.keyframes) < 2: return
+        if getattr(self.tracker_cfg, 'use_4dpm_gn', False):
+            try:
+                from src.integration_4dpm.gn_keyframe_solver import solve_gn_keyframe_bundle
+                images_dict = {kf: self.keyframes_data[i]["image"] for i, kf in enumerate(self.keyframes) if i < len(self.keyframes_data)} if hasattr(self, 'keyframes_data') and self.keyframes_data else {}
+                depths_dict = {kf: self.keyframes_data[i]["depth"] for i, kf in enumerate(self.keyframes) if i < len(self.keyframes_data)} if hasattr(self, 'keyframes_data') and self.keyframes_data else {}
+                masks_dict = {kf: self.keyframes_data[i]["mask"] for i, kf in enumerate(self.keyframes) if i < len(self.keyframes_data)} if hasattr(self, 'keyframes_data') and self.keyframes_data else {}
+                K = self.tracker.K_dict.get(self.keyframes[0], np.eye(3))
+                if images_dict and depths_dict:
+                    refined = solve_gn_keyframe_bundle(self.keyframes, self.tracker.poses, images_dict, depths_dict, masks_dict, K)
+                    for k_idx, p_ref in refined.items():
+                        self.tracker.poses[k_idx] = p_ref
+                    return
+            except Exception as e:
+                print(f"[BundleSdfGS] 4D_PM GN solver fallback to standard BA: {e}")
         if self.tracker_cfg.triangulate:
             self.tracker.triangulate_tracks(self.keyframes[-1], self.tracker_cfg.triangulate_thresh)
         run_ba_geometric(self.keyframes, self.tracker.poses, self.tracker.tracks, self.tracker.K_dict, fix_first=(self.keyframes[0] == 0))
